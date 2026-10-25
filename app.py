@@ -14,6 +14,8 @@ from flask import Flask, abort, request
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
+from pages import pages
+
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 # Comma-separated phone numbers allowed to use the bot, e.g. "+15551234567".
@@ -29,9 +31,13 @@ SYSTEM_PROMPT = (
     "Use plain text only: no markdown, bullet symbols, headers, or tables."
 )
 
-HELP_TEXT = "Text anything to chat with Claude. Send RESET to start a fresh conversation."
+HELP_TEXT = (
+    "Claude SMS Assistant: text anything to chat with Claude. Send RESET to start fresh. "
+    "Reply STOP to opt out. Msg & data rates may apply."
+)
 
 app = Flask(__name__)
+app.register_blueprint(pages)
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 db_lock = threading.Lock()
 
@@ -127,11 +133,6 @@ def sms():
     save(phone, "user", body)
     save(phone, "assistant", reply)
     return twiml(reply)
-
-
-@app.get("/")
-def health():
-    return "Claude SMS bot is running."
 
 
 if __name__ == "__main__":

@@ -41,7 +41,18 @@ Text a phone number, get a reply from Claude. Each phone number gets its own ong
    - `ANTHROPIC_API_KEY` = your key from Step 1
    - `TWILIO_AUTH_TOKEN` = your token from Step 2
    - `ALLOWED_NUMBERS` = your own cell number in the form `+15551234567` (add more separated by commas). This stops strangers from using up your credit.
-5. Click **Deploy**. When it's done, Render shows your app's address, like `https://claude-sms-abcd.onrender.com`. Opening it in a browser should say "Claude SMS bot is running."
+   - `OWNER_NAME` = your full name, `CONTACT_EMAIL` = your email, `SMS_NUMBER` = your Twilio number. These fill in the public website pages below.
+5. Click **Deploy**. When it's done, Render shows your app's address, like `https://claude-sms-abcd.onrender.com`. Opening it in a browser shows the service's website.
+
+## The website (for Twilio's verification form)
+
+Phone carriers want a website that explains the texting service before they approve your number. The app has one built in:
+
+- `https://your-app.onrender.com/` describes the service, how people opt in, and STOP/HELP
+- `https://your-app.onrender.com/terms` is the Terms of Service
+- `https://your-app.onrender.com/privacy` is the Privacy Policy
+
+Use these addresses in the Toll-Free Verification or A2P 10DLC form.
 
 ## Step 4: Connect Twilio to the app
 
