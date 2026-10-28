@@ -54,7 +54,8 @@ HELP_TEXT = (
 
 app = Flask(__name__)
 app.register_blueprint(pages)
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+# Strip the key: a stray space or newline from pasting it makes every request fail with "Connection error".
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
 db_lock = threading.Lock()
 
 
@@ -144,7 +145,7 @@ def sms():
     try:
         reply = ask_claude(history)
     except anthropic.APIError as e:
-        app.logger.error("Claude API error: %s", e)
+        app.logger.error("Claude API error: %s (cause: %r)", e, e.__cause__)
         return twiml("Sorry, I couldn't reach Claude just now. Please try again in a minute.")
 
     save(phone, "user", body)
@@ -206,7 +207,7 @@ def voice_reply():
         reply = ask_claude(history, model=VOICE_MODEL, system=VOICE_SYSTEM_PROMPT,
                            max_tokens=300, timeout=12)
     except anthropic.APIError as e:
-        app.logger.error("Claude API error: %s", e)
+        app.logger.error("Claude API error: %s (cause: %r)", e, e.__cause__)
         listen(resp, "Sorry, I couldn't reach Claude just now. Try asking again.")
         return voice_twiml(resp)
 
