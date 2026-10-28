@@ -1,8 +1,12 @@
-"""Chat with Claude over SMS.
+"""Chat with Claude over SMS or a phone call.
 
 Twilio forwards each incoming text to POST /sms. We look up that phone
 number's recent conversation, ask Claude for a reply, and send it back
 as TwiML so Twilio texts it to the sender.
+
+Incoming calls hit POST /voice. Twilio turns the caller's speech into
+text, we ask Claude, and Twilio reads the reply aloud, in a loop until
+the caller hangs up or says goodbye.
 """
 
 import os
@@ -13,6 +17,7 @@ import anthropic
 from flask import Flask, abort, request
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.twiml.voice_response import VoiceResponse
 
 from pages import pages
 
@@ -24,12 +29,23 @@ ALLOWED_NUMBERS = {n.strip() for n in os.environ.get("ALLOWED_NUMBERS", "").spli
 DB_PATH = os.environ.get("DB_PATH", "conversations.db")
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
 MAX_SMS_CHARS = 1500  # Twilio's limit is 1600 characters per message
+# Phone replies must come back within Twilio's 15-second limit, so default to the fastest model.
+VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-haiku-5-5")
+# Any Twilio text-to-speech voice name, e.g. "Polly.Matthew-Neural".
+VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
 
 SYSTEM_PROMPT = (
     "You are Claude, chatting with someone over text message (SMS). "
     "Keep replies short and conversational, ideally under 300 characters. "
     "Use plain text only: no markdown, bullet symbols, headers, or tables."
 )
+
+VOICE_SYSTEM_PROMPT = (
+    "You are Claude, talking with someone on a phone call. Your words will be read aloud "
+    "by a text-to-speech voice. Answer in one to three short, natural spoken sentences. "
+    "Never use markdown, lists, emoji, URLs, or symbols that don't read well aloud."
+)
+GOODBYES = {"bye", "goodbye", "good bye", "bye bye", "hang up", "that's all", "thats all"}
 
 HELP_TEXT = (
     "Claude SMS Assistant: text anything to chat with Claude. Send RESET to start fresh. "
@@ -77,11 +93,12 @@ def clear_history(phone):
         conn.execute("DELETE FROM messages WHERE phone = ?", (phone,))
 
 
-def ask_claude(history):
-    response = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=600,
-        system=SYSTEM_PROMPT,
+def ask_claude(history, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT, max_tokens=600, timeout=None):
+    api = client.with_options(timeout=timeout) if timeout else client
+    response = api.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system,
         messages=history,
     )
     text = "".join(block.text for block in response.content if block.type == "text").strip()
@@ -133,6 +150,71 @@ def sms():
     save(phone, "user", body)
     save(phone, "assistant", reply)
     return twiml(reply)
+
+
+def voice_twiml(resp):
+    return str(resp), 200, {"Content-Type": "application/xml"}
+
+
+def listen(resp, prompt=None):
+    """Ask Twilio to record the caller's next sentence and send it to /voice/reply."""
+    gather = resp.gather(input="speech", action="/voice/reply", method="POST",
+                         speech_timeout="auto", language="en-US")
+    if prompt:
+        gather.say(prompt, voice=VOICE_NAME)
+    # Reached only if the caller says nothing.
+    resp.say("I didn't hear anything, so I'll hang up. Call back any time.", voice=VOICE_NAME)
+    resp.hangup()
+
+
+@app.post("/voice")
+def voice():
+    if not is_from_twilio():
+        abort(403)
+    resp = VoiceResponse()
+    if ALLOWED_NUMBERS and request.form.get("From", "") not in ALLOWED_NUMBERS:
+        resp.say("Sorry, this number isn't set up to talk with Claude.", voice=VOICE_NAME)
+        resp.hangup()
+        return voice_twiml(resp)
+    listen(resp, "Hi, this is Claude. What's on your mind?")
+    return voice_twiml(resp)
+
+
+@app.post("/voice/reply")
+def voice_reply():
+    if not is_from_twilio():
+        abort(403)
+    resp = VoiceResponse()
+    caller = request.form.get("From", "")
+    if ALLOWED_NUMBERS and caller not in ALLOWED_NUMBERS:
+        resp.hangup()
+        return voice_twiml(resp)
+
+    said = request.form.get("SpeechResult", "").strip()
+    if not said:
+        listen(resp, "Sorry, I didn't catch that. Could you say it again?")
+        return voice_twiml(resp)
+    if said.lower().strip(" .!?") in GOODBYES:
+        resp.say("Talk to you later. Goodbye!", voice=VOICE_NAME)
+        resp.hangup()
+        return voice_twiml(resp)
+
+    # Each call is its own conversation.
+    key = "call:" + request.form.get("CallSid", caller)
+    history = load_history(key) + [{"role": "user", "content": said}]
+    try:
+        reply = ask_claude(history, model=VOICE_MODEL, system=VOICE_SYSTEM_PROMPT,
+                           max_tokens=300, timeout=12)
+    except anthropic.APIError as e:
+        app.logger.error("Claude API error: %s", e)
+        listen(resp, "Sorry, I couldn't reach Claude just now. Try asking again.")
+        return voice_twiml(resp)
+
+    save(key, "user", said)
+    save(key, "assistant", reply)
+    resp.say(reply, voice=VOICE_NAME)
+    listen(resp)
+    return voice_twiml(resp)
 
 
 if __name__ == "__main__":
