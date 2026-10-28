@@ -62,6 +62,16 @@ Use these addresses in the Toll-Free Verification or A2P 10DLC form.
 
 Now text your Twilio number from your phone. Claude should reply within a few seconds.
 
+## Talking to Claude on a phone call
+
+You can also call your Twilio number and talk with Claude out loud. Voice calls don't need the texting registration, so this works right away.
+
+1. In Twilio, go to **Phone Numbers → Manage → Active numbers** and click your number.
+2. Under **Voice Configuration → A call comes in**, choose **Webhook**, method **HTTP POST**, and paste your app address with `/voice` on the end, for example `https://claude-sms-abcd.onrender.com/voice`.
+3. Save, then call the number. Claude greets you; just talk, and pause when you're done speaking. Say "goodbye" to hang up.
+
+Only numbers in `ALLOWED_NUMBERS` can talk to it. Calls use a faster model (`VOICE_MODEL`, default `claude-haiku-5-5`) so replies arrive within Twilio's time limit. You can change the voice with `VOICE_NAME` (default `Polly.Joanna-Neural`; `Polly.Matthew-Neural` is a male voice). Twilio charges about 2 cents a minute for incoming calls on a toll-free number, plus a little for speech recognition.
+
 ## Good to know
 
 - **Render's free tier falls asleep** after 15 minutes of no use. The first text after a nap can take too long and get no reply; just send it again. The paid tier avoids this.
