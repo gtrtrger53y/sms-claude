@@ -70,13 +70,27 @@ You can also call your Twilio number and talk with Claude out loud. Voice calls 
 2. Under **Voice Configuration → A call comes in**, choose **Webhook**, method **HTTP POST**, and paste your app address with `/voice` on the end, for example `https://claude-sms-abcd.onrender.com/voice`.
 3. Save, then call the number. Claude greets you; just talk, and pause when you're done speaking. Say "goodbye" to hang up.
 
-Only numbers in `ALLOWED_NUMBERS` can talk to it. Calls use a faster model (`VOICE_MODEL`, default `claude-haiku-5-5`) so replies arrive within Twilio's time limit. You can change the voice with `VOICE_NAME` (default `Polly.Joanna-Neural`; `Polly.Matthew-Neural` is a male voice). Twilio charges about 2 cents a minute for incoming calls on a toll-free number, plus a little for speech recognition.
+Only numbers in `ALLOWED_NUMBERS` can talk to it. Calls use `VOICE_MODEL` (default `claude-sonnet-5-5`; `claude-haiku-5-5` answers faster). If an answer takes more than a few seconds, Claude says "One moment" and keeps working until it's ready. You can change the voice with `VOICE_NAME` (default `Polly.Joanna-Neural`; `Polly.Matthew-Neural` is a male voice). Twilio charges about 2 cents a minute for incoming calls on a toll-free number, plus a little for speech recognition.
 
 ## Live info (news, weather, scores)
 
 Claude can search the web, so you can ask about today's news, the weather, game scores, store hours, and so on. It also knows today's date and time. Set `TIMEZONE` to where you live (default `America/New_York`; for example `America/Chicago` or `America/Los_Angeles`).
 
-Each search costs about a cent on your Anthropic bill and makes that reply a few seconds slower. On phone calls Claude does at most one search per question so it stays within the time limit. Set `WEB_SEARCH=off` to turn searching off. If searches never seem to happen, check that web search is allowed in your Anthropic Console's organization settings.
+Each search costs about a cent on your Anthropic bill and makes that reply a few seconds slower. Set `WEB_SEARCH=off` to turn searching off. If searches never seem to happen, check that web search is allowed in your Anthropic Console's organization settings.
+
+## Gmail
+
+Claude can check your Gmail (find, read, and summarize emails) and send emails for you. Before sending, it always reads the email back and waits for you to say yes. It never deletes anything or marks mail as read.
+
+1. Turn on **2-Step Verification** for your Google account at **myaccount.google.com/security** (Google requires it for the next step).
+2. Go to **myaccount.google.com/apppasswords**, type a name such as `Claude phone`, and click **Create**. Copy the 16-letter password it shows.
+3. In Render, under **Environment**, add `GMAIL_ADDRESS` = your Gmail address and `GMAIL_APP_PASSWORD` = that 16-letter password, then save.
+
+Try "Do I have any new emails?" or "Find the email from Amazon about my order." To turn Gmail off, delete those two variables. To cut off access completely, delete the app password at myaccount.google.com/apppasswords.
+
+## Slow answers on texts
+
+Searching the web or your email can take longer than the 15 seconds Twilio waits for a text reply. Add `TWILIO_ACCOUNT_SID` (on the Twilio Console home page, next to the Auth Token) in Render, and the app will text the answer as soon as it's ready instead.
 
 ## Good to know
 
