@@ -72,6 +72,12 @@ You can also call your Twilio number and talk with Claude out loud. Voice calls 
 
 Only numbers in `ALLOWED_NUMBERS` can talk to it. Calls use a faster model (`VOICE_MODEL`, default `claude-haiku-5-5`) so replies arrive within Twilio's time limit. You can change the voice with `VOICE_NAME` (default `Polly.Joanna-Neural`; `Polly.Matthew-Neural` is a male voice). Twilio charges about 2 cents a minute for incoming calls on a toll-free number, plus a little for speech recognition.
 
+## Live info (news, weather, scores)
+
+Claude can search the web, so you can ask about today's news, the weather, game scores, store hours, and so on. It also knows today's date and time. Set `TIMEZONE` to where you live (default `America/New_York`; for example `America/Chicago` or `America/Los_Angeles`).
+
+Each search costs about a cent on your Anthropic bill and makes that reply a few seconds slower. On phone calls Claude does at most one search per question so it stays within the time limit. Set `WEB_SEARCH=off` to turn searching off. If searches never seem to happen, check that web search is allowed in your Anthropic Console's organization settings.
+
 ## Good to know
 
 - **Render's free tier falls asleep** after 15 minutes of no use. The first text after a nap can take too long and get no reply; just send it again. The paid tier avoids this.

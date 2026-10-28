@@ -12,6 +12,8 @@ the caller hangs up or says goodbye.
 import os
 import sqlite3
 import threading
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import anthropic
 from flask import Flask, abort, request
@@ -33,17 +35,26 @@ MAX_SMS_CHARS = 1500  # Twilio's limit is 1600 characters per message
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-haiku-5-5")
 # Any Twilio text-to-speech voice name, e.g. "Polly.Matthew-Neural".
 VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
+# Lets Claude know today's date and time where you live.
+TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
+# Set WEB_SEARCH=off to stop Claude looking things up online (each search costs about a cent).
+WEB_SEARCH = os.environ.get("WEB_SEARCH", "on").lower() not in {"off", "no", "false", "0"}
+# Models that support the newer web search tool, which filters results before reading them.
+NEW_SEARCH_MODELS = ("claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+                     "claude-sonnet-5", "claude-sonnet-4-6")
 
 SYSTEM_PROMPT = (
     "You are Claude, chatting with someone over text message (SMS). "
     "Keep replies short and conversational, ideally under 300 characters. "
-    "Use plain text only: no markdown, bullet symbols, headers, or tables."
+    "Use plain text only: no markdown, bullet symbols, headers, or tables. "
+    "For anything current, like news, weather, scores, prices, or hours, search the web first."
 )
 
 VOICE_SYSTEM_PROMPT = (
     "You are Claude, talking with someone on a phone call. Your words will be read aloud "
     "by a text-to-speech voice. Answer in one to three short, natural spoken sentences. "
-    "Never use markdown, lists, emoji, URLs, or symbols that don't read well aloud."
+    "Never use markdown, lists, emoji, URLs, or symbols that don't read well aloud. "
+    "For anything current, like news, weather, scores, prices, or hours, search the web first."
 )
 GOODBYES = {"bye", "goodbye", "good bye", "bye bye", "hang up", "that's all", "thats all"}
 
@@ -95,15 +106,33 @@ def clear_history(phone):
         conn.execute("DELETE FROM messages WHERE phone = ?", (phone,))
 
 
-def ask_claude(history, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT, max_tokens=600, timeout=None):
+def search_tool(model, max_uses):
+    version = "web_search_20260209" if model.startswith(NEW_SEARCH_MODELS) else "web_search_20250305"
+    return {"type": version, "name": "web_search", "max_uses": max_uses}
+
+
+def ask_claude(history, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT, max_tokens=600, timeout=None,
+               searches=3):
     api = client.with_options(timeout=timeout) if timeout else client
-    response = api.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=history,
-    )
-    text = "".join(block.text for block in response.content if block.type == "text").strip()
+    now = datetime.now(ZoneInfo(TIMEZONE))
+    system = f"{system} Right now it is {now:%A, %B %-d, %Y, %-I:%M %p} ({TIMEZONE})."
+    extra = {"tools": [search_tool(model, searches)]} if WEB_SEARCH and searches else {}
+    messages = list(history)
+    content = []
+    for _ in range(3):
+        response = api.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            **extra,
+        )
+        content += response.content
+        # A long search can pause partway; send it back so Claude can finish.
+        if response.stop_reason != "pause_turn":
+            break
+        messages = history + [{"role": "assistant", "content": content}]
+    text = "".join(block.text for block in content if block.type == "text").strip()
     return text or "(Claude had no reply.)"
 
 
@@ -144,7 +173,7 @@ def sms():
 
     history = load_history(phone) + [{"role": "user", "content": body}]
     try:
-        reply = ask_claude(history)
+        reply = ask_claude(history, max_tokens=1200)
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
         return twiml("Sorry, I couldn't reach Claude just now. Please try again in a minute.")
@@ -206,7 +235,7 @@ def voice_reply():
     history = load_history(key) + [{"role": "user", "content": said}]
     try:
         reply = ask_claude(history, model=VOICE_MODEL, system=VOICE_SYSTEM_PROMPT,
-                           max_tokens=300, timeout=12)
+                           max_tokens=400, timeout=13, searches=1)
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
         listen(resp, "Sorry, I couldn't reach Claude just now. Try asking again.")
