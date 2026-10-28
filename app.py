@@ -1,38 +1,46 @@
 """Chat with Claude over SMS or a phone call.
 
 Twilio forwards each incoming text to POST /sms. We look up that phone
-number's recent conversation, ask Claude for a reply, and send it back
-as TwiML so Twilio texts it to the sender.
+number's recent conversation, ask Claude for a reply, and text it back.
 
 Incoming calls hit POST /voice. Twilio turns the caller's speech into
 text, we ask Claude, and Twilio reads the reply aloud, in a loop until
 the caller hangs up or says goodbye.
+
+Claude can search the web and, if set up, use the owner's Gmail. That can
+take longer than Twilio waits for a webhook (15 seconds), so answers are
+worked out in the background: calls wait on /voice/wait, and texts are
+sent through Twilio's API once ready.
 """
 
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import anthropic
 from flask import Flask, abort, request
 from twilio.request_validator import RequestValidator
+from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.twiml.voice_response import VoiceResponse
 
+import gmail
 from pages import pages
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+# Lets the app text replies once they're ready, so slow answers aren't cut off.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 # Comma-separated phone numbers allowed to use the bot, e.g. "+15551234567".
 # Leave empty to allow anyone who texts your number (they'd spend your credits).
 ALLOWED_NUMBERS = {n.strip() for n in os.environ.get("ALLOWED_NUMBERS", "").split(",") if n.strip()}
 DB_PATH = os.environ.get("DB_PATH", "conversations.db")
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
 MAX_SMS_CHARS = 1500  # Twilio's limit is 1600 characters per message
-# Phone replies must come back within Twilio's 15-second limit, so default to the fastest model.
-VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-haiku-5-5")
+VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-sonnet-5-5")
 # Any Twilio text-to-speech voice name, e.g. "Polly.Matthew-Neural".
 VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
 # Lets Claude know today's date and time where you live.
@@ -67,7 +75,7 @@ app = Flask(__name__)
 app.register_blueprint(pages)
 # Remove all whitespace from the key: a space or line break picked up while pasting it
 # makes every request fail with "Connection error". Real keys never contain whitespace.
-client = anthropic.Anthropic(api_key="".join(os.environ.get("ANTHROPIC_API_KEY", "").split()))
+client = anthropic.Anthropic(api_key="".join(os.environ.get("ANTHROPIC_API_KEY", "").split()), timeout=60)
 db_lock = threading.Lock()
 
 
@@ -111,29 +119,41 @@ def search_tool(model, max_uses):
     return {"type": version, "name": "web_search", "max_uses": max_uses}
 
 
-def ask_claude(history, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT, max_tokens=600, timeout=None,
+def ask_claude(history, conversation, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT, max_tokens=1200,
                searches=3):
-    api = client.with_options(timeout=timeout) if timeout else client
+    request_number = gmail.new_request()
     now = datetime.now(ZoneInfo(TIMEZONE))
     system = f"{system} Right now it is {now:%A, %B %-d, %Y, %-I:%M %p} ({TIMEZONE})."
-    extra = {"tools": [search_tool(model, searches)]} if WEB_SEARCH and searches else {}
+    tools = [search_tool(model, searches)] if WEB_SEARCH and searches else []
+    if gmail.ENABLED:
+        tools += gmail.TOOLS
+        system += gmail.PROMPT
+    extra = {"tools": tools} if tools else {}
     messages = list(history)
-    content = []
-    for _ in range(3):
-        response = api.messages.create(
+    text = []
+    for _ in range(10):
+        response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
             messages=messages,
             **extra,
         )
-        content += response.content
-        # A long search can pause partway; send it back so Claude can finish.
-        if response.stop_reason != "pause_turn":
+        messages.append({"role": "assistant", "content": response.content})
+        text += [block.text for block in response.content if block.type == "text"]
+        if response.stop_reason == "tool_use":
+            # Claude asked to use Gmail: run it and hand back the results.
+            # Only the text after the last tool use is the reply.
+            text = []
+            messages.append({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": block.id,
+                 "content": gmail.run_tool(block.name, block.input, conversation, request_number)}
+                for block in response.content if block.type == "tool_use"
+            ]})
+        # A long web search can pause partway; send it back so Claude can finish.
+        elif response.stop_reason != "pause_turn":
             break
-        messages = history + [{"role": "assistant", "content": content}]
-    text = "".join(block.text for block in content if block.type == "text").strip()
-    return text or "(Claude had no reply.)"
+    return "".join(text).strip() or "(Claude had no reply.)"
 
 
 def is_from_twilio():
@@ -171,16 +191,33 @@ def sms():
     if body.upper() in {"HELP", "?"}:
         return twiml(HELP_TEXT)
 
+    if not TWILIO_ACCOUNT_SID:
+        return twiml(answer_text(phone, body))
+    # Reply in the background and text the answer when it's ready.
+    threading.Thread(target=send_text_reply, args=(phone, request.form.get("To", ""), body),
+                     daemon=True).start()
+    return str(MessagingResponse()), 200, {"Content-Type": "application/xml"}
+
+
+def answer_text(phone, body):
     history = load_history(phone) + [{"role": "user", "content": body}]
     try:
-        reply = ask_claude(history, max_tokens=1200)
+        reply = ask_claude(history, phone)
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
-        return twiml("Sorry, I couldn't reach Claude just now. Please try again in a minute.")
-
+        return "Sorry, I couldn't reach Claude just now. Please try again in a minute."
     save(phone, "user", body)
     save(phone, "assistant", reply)
-    return twiml(reply)
+    return reply
+
+
+def send_text_reply(phone, our_number, body):
+    reply = answer_text(phone, body)
+    try:
+        TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
+            to=phone, from_=our_number, body=reply[:MAX_SMS_CHARS])
+    except Exception as e:
+        app.logger.error("Couldn't send text: %s", e)
 
 
 def voice_twiml(resp):
@@ -231,20 +268,62 @@ def voice_reply():
         return voice_twiml(resp)
 
     # Each call is its own conversation.
-    key = "call:" + request.form.get("CallSid", caller)
+    call = request.form.get("CallSid", caller)
+    job = {"done": threading.Event(), "reply": None, "started": time.monotonic()}
+    with calls_lock:
+        calls[call] = job
+    threading.Thread(target=answer_call, args=(call, said, job), daemon=True).start()
+    # Most answers are ready in a few seconds; if not, let the caller know and keep waiting.
+    if job["done"].wait(6):
+        return speak_reply(resp, call)
+    resp.say("One moment.", voice=VOICE_NAME)
+    resp.redirect("/voice/wait", method="POST")
+    return voice_twiml(resp)
+
+
+calls = {}
+calls_lock = threading.Lock()
+
+
+def answer_call(call, said, job):
+    key = "call:" + call
     history = load_history(key) + [{"role": "user", "content": said}]
     try:
-        reply = ask_claude(history, model=VOICE_MODEL, system=VOICE_SYSTEM_PROMPT,
-                           max_tokens=400, timeout=13, searches=1)
+        job["reply"] = ask_claude(history, key, model=VOICE_MODEL, system=VOICE_SYSTEM_PROMPT,
+                                  max_tokens=800)
+        save(key, "user", said)
+        save(key, "assistant", job["reply"])
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
-        listen(resp, "Sorry, I couldn't reach Claude just now. Try asking again.")
-        return voice_twiml(resp)
+    finally:
+        job["done"].set()
 
-    save(key, "user", said)
-    save(key, "assistant", reply)
-    resp.say(reply, voice=VOICE_NAME)
-    listen(resp)
+
+def speak_reply(resp, call):
+    with calls_lock:
+        job = calls.pop(call, None)
+    if job and job["reply"]:
+        resp.say(job["reply"], voice=VOICE_NAME)
+        listen(resp)
+    else:
+        listen(resp, "Sorry, I couldn't reach Claude just now. Try asking again.")
+    return voice_twiml(resp)
+
+
+@app.post("/voice/wait")
+def voice_wait():
+    if not is_from_twilio():
+        abort(403)
+    resp = VoiceResponse()
+    call = request.form.get("CallSid", "")
+    with calls_lock:
+        job = calls.get(call)
+    if job is None:
+        listen(resp, "Sorry, I lost track of that. Could you ask again?")
+        return voice_twiml(resp)
+    if job["done"].wait(10) or time.monotonic() - job["started"] > 90:
+        return speak_reply(resp, call)
+    resp.redirect("/voice/wait", method="POST")
     return voice_twiml(resp)
 
 
