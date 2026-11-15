@@ -1,112 +1,117 @@
-# Claude over SMS
+# Claude over SMS (friends edition)
 
-Text a phone number, get a reply from Claude. Each phone number gets its own ongoing conversation (the last 20 back-and-forths are remembered). Text **RESET** to start fresh, or **HELP** for a reminder.
+One private phone number that you and the friends you add can text or call to talk with Claude. It isn't open to the public. Every phone number is its own little account with:
 
-## How it works
+- **its own conversation** (the last 20 back-and-forths),
+- **its own memory** (things it told Claude to remember, like "I'm vegetarian"),
+- **its own Gmail**, if that person chooses to connect it.
 
-1. Someone texts your Twilio phone number.
-2. Twilio forwards the text to this small web app.
-3. The app sends the conversation to Claude and gets a reply.
-4. Twilio texts the reply back.
+Everything is saved in a Postgres database (a free Neon database works), so nothing resets when the app redeploys.
 
-## What you need (about 30 minutes, one time)
+Only numbers you add reach Claude. Anyone else who texts gets one short reply saying it's private, and you get a text telling you who it was, so adding a friend is one text.
 
-| Thing | Where | Rough cost |
+## Commands
+
+**For you (the owner), texted to the service number:**
+
+| Text | What it does |
+|---|---|
+| `ADD +15551234567` | Lets that number in. Add a name after it if you like: `ADD +15551234567 Sam`. If they texted before, they get a "You're in!" text. |
+| `REMOVE +15551234567` | Takes that number out. |
+| `LIST` | Shows everyone who's in. |
+| `WAITING` | Shows numbers that texted but haven't been added. |
+
+**For you and your friends:**
+
+| Text | What it does |
+|---|---|
+| `HELP` | Lists these commands. |
+| `RESET` | Clears the conversation and starts fresh (memory stays). |
+| `MEMORY` | Shows what Claude has saved about you. |
+| `FORGET ALL` | Deletes what Claude has saved about you. |
+| `CONNECT EMAIL` | Texts a one-time link to a page where you connect your Gmail. |
+| `DISCONNECT EMAIL` | Removes your email connection. |
+| `DELETE MY DATA` | Deletes your chats, memory and email connection. |
+| `STOP` | Stops all texts (Twilio handles this). |
+
+People can also just say "remember that my mom's birthday is May 3" and Claude saves it.
+
+## Upgrading from the first version
+
+1. Replace the files in your GitHub repo with the ones in this folder (`app.py`, `gmail.py`, `pages.py`, `Procfile`, `requirements.txt`, `README.md`) and add the new `store.py`.
+2. In Render, open your service, go to **Environment**, and make sure these are set:
+   - `DATABASE_URL`: your Neon connection string (you already added this).
+   - `SECRET_KEY`: click **Add Environment Variable**, type `SECRET_KEY` as the name, and click **Generate** for the value. This encrypts friends' email passwords. Don't change it later, or everyone has to reconnect their email.
+   - `OWNER_NUMBER`: your own cell number, like `+15551234567`. If you leave it out, the first number in `ALLOWED_NUMBERS` counts as yours.
+   - `TWILIO_ACCOUNT_SID`: if it isn't there yet. It's needed to text you about new numbers, to send "You're in!" texts, and to send slow answers.
+   - Keep `ANTHROPIC_API_KEY`, `TWILIO_AUTH_TOKEN`, and the rest as they are. `ALLOWED_NUMBERS` still works; those numbers are always let in.
+3. In Render, under **Settings → Start Command**, use:
+   `gunicorn app:app --bind 0.0.0.0:$PORT --timeout 60 --workers 1 --threads 8`
+   Keep `--workers 1`: email drafts and phone calls in progress are kept in the app's memory.
+4. Save. Render redeploys by itself after the GitHub update. The database tables are created automatically on the first start.
+
+Old conversations from the first version aren't copied over (they were lost on every redeploy anyway).
+
+## Optional settings
+
+| Setting | Default | What it does |
 |---|---|---|
-| Anthropic API key | console.anthropic.com | Pay per use, usually cents per day of chatting |
-| Twilio account + phone number | twilio.com | About $1.15/month for the number plus about $0.008 per text |
-| A place to run the app | render.com (or Railway, Fly.io) | Free tier works to try it; about $7/month to keep it always on |
+| `DAILY_LIMIT` | `50` | Most texts one friend can send in 24 hours, so nobody runs up your bill. `0` means no limit. You (the owner) have no limit. |
+| `PAY_LINK` | none | Optional, if friends chip in: a payment page such as a Stripe Payment Link, included in the one reply to numbers that aren't added yet. |
+| `PRICE_TEXT` | none | What it costs, like `$5/month`. Shown with the link and on the website. |
+| `SERVICE_NAME` | `Claude SMS Assistant` | The name used in texts and on the website. |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | `claude-haiku-5-5` is much cheaper and faster; `claude-opus-5-5` is smartest. |
+| `VOICE_MODEL`, `VOICE_NAME` | Sonnet 5.5, `Polly.Joanna-Neural` | For phone calls. |
+| `WEB_SEARCH` | `on` | `off` stops web searches (each costs about a cent). |
+| `TIMEZONE` | `America/New_York` | So Claude knows the local date and time. |
+| `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD` | none | Your own Gmail. Only your number uses these; friends connect their own with `CONNECT EMAIL`. |
+| `PUBLIC_URL` | Render fills it in | The app's address, used in email-connect links. |
 
-## Step 1: Get an Anthropic API key
+## If friends chip in (optional)
 
-1. Go to **console.anthropic.com** and sign up or log in.
-2. Add a payment method under **Billing** and buy a small amount of credit (for example $5).
-3. Go to **API Keys**, click **Create Key**, and copy it somewhere safe. It starts with `sk-ant-`.
+You don't need payments at all. If friends want to share the cost, a Stripe Payment Link has no monthly fee (2.9% + 30¢ per payment); set `PAY_LINK` and `PRICE_TEXT`. Stripe needs an adult as the account holder.
 
-## Step 2: Get a Twilio phone number
+## Before friends start using it
 
-1. Sign up at **twilio.com**.
-2. In the Twilio Console, go to **Phone Numbers → Manage → Buy a number** and buy one with SMS capability.
-3. On the Console home page, copy your **Auth Token** (click to reveal it).
-4. **US numbers only:** US carriers require registration before texts go through. In the console, either register for **A2P 10DLC** (pick "Sole Proprietor" if it's just you) or buy a **toll-free** number and complete **Toll-Free Verification**. Approval can take a few days. Until then, texts may be blocked. (Trial accounts can only text numbers you've verified, and replies start with "Sent from your Twilio trial account".)
+- **Update your Twilio verification wording.** It currently describes a service only for your own use. Change it to "a private assistant for the owner and a few friends they add, who opt in by texting first." The website pages in this version already say that. If you ever charge people or open it up, the verification needs updating again.
+- **Follow Anthropic's usage policy.** You're responsible for how friends use it with your API key, and they should know they're talking to an AI.
 
-## Step 3: Put the app online (Render example)
+## How friends connect Gmail
 
-1. Put the files in this folder into a GitHub repository. (If you create an empty repo and tell me its name, I can upload them for you.)
-2. Sign up at **render.com** and click **New → Web Service**, then pick that repository.
-3. Settings:
-   - **Build command:** `pip install -r requirements.txt`
-   - **Start command:** `gunicorn app:app --bind 0.0.0.0:$PORT --timeout 60`
-4. Under **Environment**, add these variables:
-   - `ANTHROPIC_API_KEY` = your key from Step 1
-   - `TWILIO_AUTH_TOKEN` = your token from Step 2
-   - `ALLOWED_NUMBERS` = your own cell number in the form `+15551234567` (add more separated by commas). This stops strangers from using up your credit.
-   - `OWNER_NAME` = your full name, `CONTACT_EMAIL` = your email, `SMS_NUMBER` = your Twilio number. These fill in the public website pages below.
-5. Click **Deploy**. When it's done, Render shows your app's address, like `https://claude-sms-abcd.onrender.com`. Opening it in a browser shows the service's website.
+1. Your friend texts `CONNECT EMAIL`.
+2. They get a link that works once, for 15 minutes, to a page on your site.
+3. The page shows how to make a Gmail app password, and they type their Gmail address and app password there. Nobody ever texts a password.
+4. The app checks that Google accepts it, then saves it encrypted with your `SECRET_KEY`.
 
-## The website (for Twilio's verification form)
+Claude can then search, read, and summarize their email, and send email only after reading the draft back and getting a yes. It never deletes email.
 
-Phone carriers want a website that explains the texting service before they approve your number. The app has one built in:
+Holding friends' email access is a real responsibility, so only connect people who want it. A "Sign in with Google" button would be nicer, but Google reviews apps that read Gmail before letting the public use them, so that's a later step if you ever want it.
 
-- `https://your-app.onrender.com/` describes the service, how people opt in, and STOP/HELP
-- `https://your-app.onrender.com/terms` is the Terms of Service
-- `https://your-app.onrender.com/privacy` is the Privacy Policy
+## What it costs per month
 
-Use these addresses in the Toll-Free Verification or A2P 10DLC form.
+| Thing | Cost |
+|---|---|
+| Render | $0 on the Free instance (sleeps when idle; the first text after a nap can be slow). $7/month for an always-on instance. The $25 Pro plan isn't needed. |
+| Neon | $0 on the Free plan (1 GB, plenty for texts). It naps after 5 idle minutes, so the first text after a quiet spell is about a second slower. |
+| Twilio | $2.15/month for a toll-free number ($1.15 local), plus about 1.2¢ per text segment in or out (carrier fees included). A segment is about 153 characters, so a 300-character reply is 2 segments. |
+| Claude API | About 1–2¢ per reply on Sonnet 5.5, plus about 1¢ per web search. Haiku 5.5 costs a small fraction of that. |
+| Stripe | No monthly fee; 2.9% + 30¢ per payment. |
 
-## Step 4: Connect Twilio to the app
+Roughly 5¢ per back-and-forth, so a friend who sends 100 texts a month costs you about $5. Prices were checked in November 2026.
 
-1. In Twilio, go to **Phone Numbers → Manage → Active numbers** and click your number.
-2. Under **Messaging → A message comes in**, choose **Webhook**, method **HTTP POST**, and paste your app address with `/sms` on the end, for example `https://claude-sms-abcd.onrender.com/sms`.
-3. Save.
+## The website
 
-Now text your Twilio number from your phone. Claude should reply within a few seconds.
+`/` describes the service, `/terms` is the Terms of Service, `/privacy` is the Privacy Policy. Use these in the Twilio verification form.
 
-## Talking to Claude on a phone call
+## Running it on your own computer (optional)
 
-You can also call your Twilio number and talk with Claude out loud. Voice calls don't need the texting registration, so this works right away.
-
-1. In Twilio, go to **Phone Numbers → Manage → Active numbers** and click your number.
-2. Under **Voice Configuration → A call comes in**, choose **Webhook**, method **HTTP POST**, and paste your app address with `/voice` on the end, for example `https://claude-sms-abcd.onrender.com/voice`.
-3. Save, then call the number. Claude greets you; just talk, and pause when you're done speaking. Say "goodbye" to hang up.
-
-Only numbers in `ALLOWED_NUMBERS` can talk to it. Calls use `VOICE_MODEL` (default `claude-sonnet-5-5`; `claude-haiku-5-5` answers faster). If an answer takes more than a few seconds, Claude says "One moment" and keeps working until it's ready. You can change the voice with `VOICE_NAME` (default `Polly.Joanna-Neural`; `Polly.Matthew-Neural` is a male voice). Twilio charges about 2 cents a minute for incoming calls on a toll-free number, plus a little for speech recognition.
-
-## Live info (news, weather, scores)
-
-Claude can search the web, so you can ask about today's news, the weather, game scores, store hours, and so on. It also knows today's date and time. Set `TIMEZONE` to where you live (default `America/New_York`; for example `America/Chicago` or `America/Los_Angeles`).
-
-Each search costs about a cent on your Anthropic bill and makes that reply a few seconds slower. Set `WEB_SEARCH=off` to turn searching off. If searches never seem to happen, check that web search is allowed in your Anthropic Console's organization settings.
-
-## Gmail
-
-Claude can check your Gmail (find, read, and summarize emails) and send emails for you. Before sending, it always reads the email back and waits for you to say yes. It never deletes anything or marks mail as read.
-
-1. Turn on **2-Step Verification** for your Google account at **myaccount.google.com/security** (Google requires it for the next step).
-2. Go to **myaccount.google.com/apppasswords**, type a name such as `Claude phone`, and click **Create**. Copy the 16-letter password it shows.
-3. In Render, under **Environment**, add `GMAIL_ADDRESS` = your Gmail address and `GMAIL_APP_PASSWORD` = that 16-letter password, then save.
-
-Try "Do I have any new emails?" or "Find the email from Amazon about my order." To turn Gmail off, delete those two variables. To cut off access completely, delete the app password at myaccount.google.com/apppasswords.
-
-## Slow answers on texts
-
-Searching the web or your email can take longer than the 15 seconds Twilio waits for a text reply. Add `TWILIO_ACCOUNT_SID` (on the Twilio Console home page, next to the Auth Token) in Render, and the app will text the answer as soon as it's ready instead.
-
-## Good to know
-
-- **Render's free tier falls asleep** after 15 minutes of no use. The first text after a nap can take too long and get no reply; just send it again. The paid tier avoids this.
-- **Memory resets on redeploy** on most free hosts, because the conversation file isn't kept. Attach a persistent disk (Render paid) if you want history to survive.
-- **Changing the model:** set `ANTHROPIC_MODEL` (default `claude-sonnet-5-5`). `claude-haiku-5-5` is cheaper and faster; `claude-opus-5-5` is smartest but slower and pricier.
-- **Long replies** are capped at 1,500 characters (Twilio's per-message limit is 1,600). Claude is told to keep answers short and plain-text.
-- **Security:** the app checks Twilio's signature on every request, so only Twilio can talk to it. Never share your API key or Auth Token.
-
-## Running it on your own computer (optional, for tinkering)
+Without `DATABASE_URL` it saves to a local file, `conversations.db`.
 
 ```
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...
-export TWILIO_AUTH_TOKEN=...
+export ANTHROPIC_API_KEY=...
+export ALLOWED_NUMBERS=+15551234567
 python app.py
 ```
 
-Then use a tunnel such as `ngrok http 5000` and paste the ngrok address plus `/sms` into Twilio.
+Without `TWILIO_AUTH_TOKEN` the app skips Twilio's signature check, so only do that on your own computer.
