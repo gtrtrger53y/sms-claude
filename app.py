@@ -1,20 +1,24 @@
-"""Chat with Claude over SMS or a phone call.
+"""Chat with Claude over SMS or a phone call, with one shared number for many people.
 
-Twilio forwards each incoming text to POST /sms. We look up that phone
-number's recent conversation, ask Claude for a reply, and text it back.
+Every phone number that texts in is its own little account, saved in the
+database (Postgres such as Neon, or SQLite for testing): its own conversation,
+its own memory of things it asked Claude to remember, and optionally its own
+connected Gmail. It's private: only numbers the owner has added (friends) reach
+Claude. Anyone else gets one short reply saying it's private.
 
-Incoming calls hit POST /voice. Twilio turns the caller's speech into
-text, we ask Claude, and Twilio reads the reply aloud, in a loop until
-the caller hangs up or says goodbye.
+The owner manages members by texting the service number:
+  ADD +15551234567 [name]   let a number in
+  REMOVE +15551234567       take a number out
+  LIST                      see who's in
+  WAITING                   see numbers that texted but aren't in yet
 
-Claude can search the web and, if set up, use the owner's Gmail. That can
-take longer than Twilio waits for a webhook (15 seconds), so answers are
-worked out in the background: calls wait on /voice/wait, and texts are
-sent through Twilio's API once ready.
+Twilio forwards each incoming text to POST /sms and each call to POST /voice.
+Answers that take a while (web search, email) are worked out in the background:
+calls wait on /voice/wait, and texts are sent through Twilio's API once ready.
 """
 
 import os
-import sqlite3
+import re
 import threading
 import time
 from datetime import datetime
@@ -28,18 +32,27 @@ from twilio.twiml.messaging_response import MessagingResponse
 from twilio.twiml.voice_response import VoiceResponse
 
 import gmail
-from pages import pages
+import store
+from pages import PAY_LINK, PRICE_TEXT, SERVICE_NAME, pages
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
-# Lets the app text replies once they're ready, so slow answers aren't cut off.
+# Lets the app text replies once they're ready, so slow answers aren't cut off,
+# and lets it text the owner when a new number writes in.
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
-# Comma-separated phone numbers allowed to use the bot, e.g. "+15551234567".
-# Leave empty to allow anyone who texts your number (they'd spend your credits).
-ALLOWED_NUMBERS = {n.strip() for n in os.environ.get("ALLOWED_NUMBERS", "").split(",") if n.strip()}
-DB_PATH = os.environ.get("DB_PATH", "conversations.db")
+# Numbers that are always allowed, comma-separated, e.g. "+15551234567". More can be
+# added by texting ADD. The owner's number (below) is always allowed.
+ALLOWED_NUMBERS = {p for p in (store.normalize_phone(n) for n in
+                               os.environ.get("ALLOWED_NUMBERS", "").split(",")) if p}
+# The number that can text ADD / REMOVE / LIST. Defaults to the first ALLOWED_NUMBERS entry.
+OWNER_NUMBER = store.normalize_phone(os.environ.get("OWNER_NUMBER", "")) or next(
+    (p for p in (store.normalize_phone(n) for n in os.environ.get("ALLOWED_NUMBERS", "").split(","))
+     if p), None)
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
+# Most texts a member (not the owner) can send in 24 hours. 0 means no limit.
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
 MAX_SMS_CHARS = 1500  # Twilio's limit is 1600 characters per message
+MAX_MEMORY_CHARS = 2000
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-sonnet-5-5")
 # Any Twilio text-to-speech voice name, e.g. "Polly.Matthew-Neural".
 VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
@@ -47,6 +60,8 @@ VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
 TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 # Set WEB_SEARCH=off to stop Claude looking things up online (each search costs about a cent).
 WEB_SEARCH = os.environ.get("WEB_SEARCH", "on").lower() not in {"off", "no", "false", "0"}
+# The app's public address, for email-connect links. Render fills in RENDER_EXTERNAL_URL itself.
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 # Models that support the newer web search tool, which filters results before reading them.
 NEW_SEARCH_MODELS = ("claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
                      "claude-sonnet-5", "claude-sonnet-4-6")
@@ -64,71 +79,260 @@ VOICE_SYSTEM_PROMPT = (
     "Never use markdown, lists, emoji, URLs, or symbols that don't read well aloud. "
     "For anything current, like news, weather, scores, prices, or hours, search the web first."
 )
+
+MEMORY_PROMPT = (
+    " You have a memory for this person that lasts between conversations. When they tell you "
+    "something lasting about themselves (their name, where they live, preferences, people in "
+    "their life) or ask you to remember something, save it with the remember tool, as one short "
+    "note. If they ask you to forget something, use the forget tool. Don't announce that you "
+    "saved a note unless they asked you to remember it."
+)
+
+MEMORY_TOOLS = [
+    {
+        "name": "remember",
+        "description": "Save one short, lasting note about this person for future conversations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"note": {"type": "string", "description": "One short fact, e.g. 'Lives in Denver'"}},
+            "required": ["note"],
+        },
+    },
+    {
+        "name": "forget",
+        "description": "Delete saved notes that contain this text.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "Words from the note to delete"}},
+            "required": ["text"],
+        },
+    },
+]
+
 GOODBYES = {"bye", "goodbye", "good bye", "bye bye", "hang up", "that's all", "thats all"}
+# Twilio handles these itself (opt-out and opt-back-in), so the app stays quiet.
+OPT_OUT_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "OPTOUT", "REVOKE",
+                 "START", "UNSTOP"}
 
 HELP_TEXT = (
-    "Claude SMS Assistant: text anything to chat with Claude. Send RESET to start fresh. "
-    "Reply STOP to opt out. Msg & data rates may apply."
+    f"{SERVICE_NAME}: text anything to chat with Claude, an AI. RESET starts fresh. MEMORY shows what "
+    "I remember, FORGET ALL clears it. CONNECT EMAIL links your Gmail. DELETE MY DATA erases "
+    "everything. Reply STOP to opt out. Msg & data rates may apply."
 )
+OWNER_HELP = "Owner: ADD +15551234567 [name], REMOVE +15551234567, LIST, WAITING."
 
 app = Flask(__name__)
 app.register_blueprint(pages)
 # Remove all whitespace from the key: a space or line break picked up while pasting it
 # makes every request fail with "Connection error". Real keys never contain whitespace.
 client = anthropic.Anthropic(api_key="".join(os.environ.get("ANTHROPIC_API_KEY", "").split()), timeout=60)
-db_lock = threading.Lock()
+
+_db_ready = False
+_db_lock = threading.Lock()
 
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS messages ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " phone TEXT NOT NULL,"
-        " role TEXT NOT NULL,"
-        " content TEXT NOT NULL)"
-    )
-    return conn
+def ensure_db():
+    global _db_ready
+    if not _db_ready:
+        with _db_lock:
+            if not _db_ready:
+                store.init()
+                _db_ready = True
 
 
-def load_history(phone):
-    with db_lock, db() as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM messages WHERE phone = ? ORDER BY id DESC LIMIT ?",
-            (phone, HISTORY_TURNS * 2),
-        ).fetchall()
-    history = [{"role": r, "content": c} for r, c in reversed(rows)]
-    # The API requires the conversation to start with a user message.
-    while history and history[0]["role"] != "user":
-        history.pop(0)
-    return history
+try:
+    ensure_db()
+except Exception as e:  # The database may still be waking up; try again on the first text.
+    app.logger.error("Database not ready at startup: %s", e)
 
 
-def save(phone, role, content):
-    with db_lock, db() as conn:
-        conn.execute("INSERT INTO messages (phone, role, content) VALUES (?, ?, ?)", (phone, role, content))
+@app.before_request
+def before():
+    ensure_db()
 
 
-def clear_history(phone):
-    with db_lock, db() as conn:
-        conn.execute("DELETE FROM messages WHERE phone = ?", (phone,))
+# ---------- small rate limits (in memory, reset when the app restarts) ----------
 
+_counters = {}
+_counters_lock = threading.Lock()
+
+
+def allow(kind, per_day):
+    """True at most per_day times a day for this kind of message, so spam can't run up the bill."""
+    day = int(time.time() // 86400)
+    with _counters_lock:
+        key = (kind, day)
+        _counters[key] = _counters.get(key, 0) + 1
+        for old in [k for k in _counters if k[1] != day]:
+            del _counters[old]
+        return _counters[key] <= per_day
+
+
+# ---------- accounts ----------
+
+def account(phone):
+    """Return (role, user) where role is 'owner', 'member', or None for everyone else."""
+    if not phone:
+        return None, None
+    if phone == OWNER_NUMBER:
+        return "owner", store.ensure_user(phone, "active")
+    user = store.get_user(phone)
+    if phone in ALLOWED_NUMBERS:
+        if not user or user["status"] == "pending":
+            store.set_status(phone, "active")
+            user = store.get_user(phone)
+        if user["status"] == "active":
+            return "member", user
+    if user and user["status"] == "active":
+        return "member", user
+    return None, user
+
+
+def send_text(to, from_, body):
+    if not TWILIO_ACCOUNT_SID:
+        return False
+    try:
+        TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
+            to=to, from_=from_, body=body[:MAX_SMS_CHARS])
+        return True
+    except Exception as e:
+        app.logger.error("Couldn't send text: %s", e)
+        return False
+
+
+def stranger_reply(phone, body, our_number, user):
+    """A number that isn't a member texted. Reply once a day at most, and tell the owner once."""
+    new = user is None
+    if new:
+        user = store.ensure_user(phone, "pending")
+        if OWNER_NUMBER and allow("owner-notice", 20):
+            send_text(OWNER_NUMBER, our_number,
+                      f"New number {phone} texted {SERVICE_NAME}: \"{body[:80]}\". "
+                      f"Reply ADD {phone} to let them in.")
+    store.touch(phone)
+    if time.time() - (user.get("last_notice") or 0) < 86400 or not allow("stranger-reply", 200):
+        return ""
+    store.set_last_notice(phone)
+    text = f"Hi! {SERVICE_NAME} is a private AI assistant by text, just for friends of its owner."
+    if PAY_LINK:
+        text += f" If you're joining{' (' + PRICE_TEXT + ')' if PRICE_TEXT else ''}, pay here: {PAY_LINK} "
+        text += "You'll get a text once your number is added."
+    else:
+        text += " If you know the owner, ask them to add your number."
+    return text + " Reply STOP to opt out."
+
+
+def owner_command(body, our_number):
+    """Handle ADD / REMOVE / LIST from the owner. Returns a reply, or None if it isn't a command."""
+    words = body.split()
+    command = words[0].upper() if words else ""
+    if command == "LIST" and len(words) == 1:
+        members = store.list_users("active")
+        others = [(p, n) for p, n in members if p != OWNER_NUMBER]
+        if not others:
+            return "No members yet besides you. Text ADD +15551234567 to add one."
+        lines = [f"{p}{' ' + n if n else ''}" for p, n in others]
+        return f"{len(others)} member(s):\n" + "\n".join(lines)
+    if command == "WAITING" and len(words) == 1:
+        waiting = store.list_users("pending")[-15:]
+        if not waiting:
+            return "Nobody is waiting."
+        return "Texted but not added yet:\n" + "\n".join(p for p, _ in waiting) + "\nReply ADD +1... to add one."
+    if command not in {"ADD", "REMOVE"} or len(words) < 2:
+        return None
+    # The number may be typed with spaces, like "ADD +1 555 123 4567 Sam".
+    end = 1
+    while end < len(words) and re.fullmatch(r"[\d+().\-]+", words[end]):
+        end += 1
+    phone, rest = store.normalize_phone(" ".join(words[1:end])), words[end:]
+    if not phone:
+        return f"I couldn't read that number. Try: {command} +15551234567"
+    if phone == OWNER_NUMBER:
+        return "That's your own number; it's always allowed."
+    name = " ".join(rest)[:40]
+    if command == "ADD":
+        before = store.get_user(phone)
+        store.set_status(phone, "active", name or (before or {}).get("name", ""))
+        welcomed = False
+        # Only text people who already texted in (they asked to join).
+        if before and before.get("last_seen"):
+            welcomed = send_text(phone, our_number,
+                                 f"You're in! Text anything to chat with {SERVICE_NAME}. Text HELP for "
+                                 "commands. Reply STOP to opt out.")
+        return f"Added {phone}{' (' + name + ')' if name else ''}." + (" I texted them." if welcomed else "")
+    user = store.get_user(phone)
+    if not user or user["status"] != "active":
+        return f"{phone} isn't a member."
+    store.set_status(phone, "removed")
+    return f"Removed {phone}. Their saved chats stay until they text DELETE MY DATA."
+
+
+def connect_link(phone):
+    if not gmail.can_store_passwords():
+        return "Email connecting isn't set up yet (the owner needs to add SECRET_KEY)."
+    base = PUBLIC_URL or request.url_root.rstrip("/").replace("http://", "https://", 1)
+    token = store.new_link_token(phone, "gmail")
+    return (f"Open this link to connect your Gmail (works once, for 15 minutes): {base}/connect/{token} "
+            "Never text your password here.")
+
+
+# ---------- Claude ----------
 
 def search_tool(model, max_uses):
     version = "web_search_20260209" if model.startswith(NEW_SEARCH_MODELS) else "web_search_20250305"
     return {"type": version, "name": "web_search", "max_uses": max_uses}
 
 
-def ask_claude(history, conversation, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT, max_tokens=1200,
-               searches=3):
+def remember(phone, note):
+    note = " ".join(str(note).split())[:200]
+    if not note:
+        return "Nothing to save."
+    memory = (store.get_user(phone) or {}).get("memory", "")
+    notes = [n for n in memory.split("\n") if n]
+    if note in notes:
+        return "Already saved."
+    notes.append(note)
+    while len("\n".join(notes)) > MAX_MEMORY_CHARS and len(notes) > 1:
+        notes.pop(0)  # oldest notes go first when memory is full
+    store.set_memory(phone, "\n".join(notes))
+    return "Saved."
+
+
+def forget(phone, text):
+    text = str(text).strip().lower()
+    memory = (store.get_user(phone) or {}).get("memory", "")
+    notes = [n for n in memory.split("\n") if n]
+    kept = [n for n in notes if text not in n.lower()] if text else notes
+    store.set_memory(phone, "\n".join(kept))
+    return f"Deleted {len(notes) - len(kept)} note(s)."
+
+
+def run_tool(phone, creds, name, args, request_number):
+    if name == "remember":
+        return remember(phone, args.get("note", ""))
+    if name == "forget":
+        return forget(phone, args.get("text", ""))
+    if creds:
+        return gmail.run_tool(creds, name, args, phone, request_number)
+    return f"Unknown tool {name}."
+
+
+def ask_claude(phone, user, role, history, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT,
+               max_tokens=1200, searches=3):
     request_number = gmail.new_request()
     now = datetime.now(ZoneInfo(TIMEZONE))
     system = f"{system} Right now it is {now:%A, %B %-d, %Y, %-I:%M %p} ({TIMEZONE})."
+    if user.get("name"):
+        system += f" This person's name is {user['name']}."
+    system += MEMORY_PROMPT
+    memory = user.get("memory", "")
+    system += (" Your saved notes about this person:\n" + memory) if memory else " You have no saved notes yet."
     tools = [search_tool(model, searches)] if WEB_SEARCH and searches else []
-    if gmail.ENABLED:
+    tools += MEMORY_TOOLS
+    creds = gmail.credentials_for(user, role == "owner")
+    if creds:
         tools += gmail.TOOLS
         system += gmail.PROMPT
-    extra = {"tools": tools} if tools else {}
     messages = list(history)
     text = []
     for _ in range(10):
@@ -137,17 +341,17 @@ def ask_claude(history, conversation, model=ANTHROPIC_MODEL, system=SYSTEM_PROMP
             max_tokens=max_tokens,
             system=system,
             messages=messages,
-            **extra,
+            tools=tools,
         )
         messages.append({"role": "assistant", "content": response.content})
         text += [block.text for block in response.content if block.type == "text"]
         if response.stop_reason == "tool_use":
-            # Claude asked to use Gmail: run it and hand back the results.
+            # Claude asked to use memory or Gmail: run it and hand back the results.
             # Only the text after the last tool use is the reply.
             text = []
             messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": block.id,
-                 "content": gmail.run_tool(block.name, block.input, conversation, request_number)}
+                 "content": run_tool(phone, creds, block.name, block.input, request_number)}
                 for block in response.content if block.type == "tool_use"
             ]})
         # A long web search can pause partway; send it back so Claude can finish.
@@ -155,6 +359,8 @@ def ask_claude(history, conversation, model=ANTHROPIC_MODEL, system=SYSTEM_PROMP
             break
     return "".join(text).strip() or "(Claude had no reply.)"
 
+
+# ---------- texts ----------
 
 def is_from_twilio():
     if not TWILIO_AUTH_TOKEN:
@@ -169,7 +375,8 @@ def is_from_twilio():
 
 def twiml(text):
     resp = MessagingResponse()
-    resp.message(text[:MAX_SMS_CHARS])
+    if text:
+        resp.message(text[:MAX_SMS_CHARS])
     return str(resp), 200, {"Content-Type": "application/xml"}
 
 
@@ -178,47 +385,83 @@ def sms():
     if not is_from_twilio():
         abort(403)
 
-    phone = request.form.get("From", "")
+    phone = store.normalize_phone(request.form.get("From", "")) or request.form.get("From", "")
+    our_number = request.form.get("To", "")
     body = request.form.get("Body", "").strip()
+    upper = " ".join(body.upper().split())
 
-    if ALLOWED_NUMBERS and phone not in ALLOWED_NUMBERS:
-        return twiml("Sorry, this number isn't set up to chat.")
+    if upper in OPT_OUT_WORDS:
+        return twiml("")
+    role, user = account(phone)
+    if role is None:
+        return twiml(stranger_reply(phone, body, our_number, user))
+    store.touch(phone)
+
     if not body:
         return twiml(HELP_TEXT)
-    if body.upper() in {"RESET", "NEW", "CLEAR"}:
-        clear_history(phone)
+    if role == "owner":
+        reply = owner_command(body, our_number)
+        if reply:
+            return twiml(reply)
+    if upper in {"RESET", "NEW", "CLEAR"}:
+        store.clear_history(phone)
         return twiml("Conversation cleared. What's on your mind?")
-    if body.upper() in {"HELP", "?"}:
-        return twiml(HELP_TEXT)
+    if upper in {"HELP", "?"}:
+        return twiml(HELP_TEXT + (" " + OWNER_HELP if role == "owner" else ""))
+    if upper in {"MEMORY", "MY MEMORY", "WHAT DO YOU REMEMBER"}:
+        memory = user.get("memory", "")
+        return twiml("What I remember:\n" + memory if memory else
+                     "I haven't saved anything about you yet. Tell me something to remember!")
+    if upper == "FORGET ALL":
+        store.set_memory(phone, "")
+        return twiml("Done. I've forgotten everything I had saved about you.")
+    if upper in {"CONNECT EMAIL", "CONNECT GMAIL"}:
+        return twiml(connect_link(phone))
+    if upper in {"DISCONNECT EMAIL", "DISCONNECT GMAIL"}:
+        store.set_gmail(phone, "", "")
+        extra = " (Your owner email in Render settings still works.)" if role == "owner" and \
+            gmail.OWNER_GMAIL_ADDRESS else ""
+        return twiml("Email disconnected. You can also delete the app password at "
+                     "myaccount.google.com/apppasswords." + extra)
+    if upper == "DELETE MY DATA":
+        store.delete_user_data(phone)
+        return twiml("Deleted your chats, saved notes and email connection.")
+
+    if role != "owner" and DAILY_LIMIT and \
+            store.messages_since(phone, time.time() - 86400) >= DAILY_LIMIT:
+        return twiml(f"You've reached today's limit of {DAILY_LIMIT} messages. Try again tomorrow!")
 
     if not TWILIO_ACCOUNT_SID:
-        return twiml(answer_text(phone, body))
+        return twiml(answer_text(phone, user, role, body))
     # Reply in the background and text the answer when it's ready.
-    threading.Thread(target=send_text_reply, args=(phone, request.form.get("To", ""), body),
+    threading.Thread(target=send_text_reply, args=(phone, user, role, our_number, body),
                      daemon=True).start()
-    return str(MessagingResponse()), 200, {"Content-Type": "application/xml"}
+    return twiml("")
 
 
-def answer_text(phone, body):
-    history = load_history(phone) + [{"role": "user", "content": body}]
+def answer_text(phone, user, role, body):
+    history = store.load_history(phone, HISTORY_TURNS) + [{"role": "user", "content": body}]
     try:
-        reply = ask_claude(history, phone)
+        reply = ask_claude(phone, user, role, history)
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
         return "Sorry, I couldn't reach Claude just now. Please try again in a minute."
-    save(phone, "user", body)
-    save(phone, "assistant", reply)
+    store.save_message(phone, "user", body)
+    store.save_message(phone, "assistant", reply)
+    store.prune_history(phone, max(HISTORY_TURNS * 2, DAILY_LIMIT * 2) + 10)
     return reply
 
 
-def send_text_reply(phone, our_number, body):
-    reply = answer_text(phone, body)
+def send_text_reply(phone, user, role, our_number, body):
     try:
-        TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
-            to=phone, from_=our_number, body=reply[:MAX_SMS_CHARS])
+        reply = answer_text(phone, user, role, body)
     except Exception as e:
-        app.logger.error("Couldn't send text: %s", e)
+        app.logger.exception("Couldn't answer: %s", e)
+        reply = "Sorry, something went wrong. Please try again."
+    send_text(phone, our_number, reply)
 
+
+# ---------- phone calls ----------
 
 def voice_twiml(resp):
     return str(resp), 200, {"Content-Type": "application/xml"}
@@ -235,13 +478,20 @@ def listen(resp, prompt=None):
     resp.hangup()
 
 
+def caller_number():
+    raw = request.form.get("From", "")
+    return store.normalize_phone(raw) or raw
+
+
 @app.post("/voice")
 def voice():
     if not is_from_twilio():
         abort(403)
     resp = VoiceResponse()
-    if ALLOWED_NUMBERS and request.form.get("From", "") not in ALLOWED_NUMBERS:
-        resp.say("Sorry, this number isn't set up to talk with Claude.", voice=VOICE_NAME)
+    role, _ = account(caller_number())
+    if role is None:
+        resp.say(f"Sorry, {SERVICE_NAME} is a private service. If you know the owner, ask them to add your number.",
+                 voice=VOICE_NAME)
         resp.hangup()
         return voice_twiml(resp)
     listen(resp, "Hi, this is Claude. What's on your mind?")
@@ -253,8 +503,9 @@ def voice_reply():
     if not is_from_twilio():
         abort(403)
     resp = VoiceResponse()
-    caller = request.form.get("From", "")
-    if ALLOWED_NUMBERS and caller not in ALLOWED_NUMBERS:
+    caller = caller_number()
+    role, user = account(caller)
+    if role is None:
         resp.hangup()
         return voice_twiml(resp)
 
@@ -267,12 +518,12 @@ def voice_reply():
         resp.hangup()
         return voice_twiml(resp)
 
-    # Each call is its own conversation.
+    # Each call is its own conversation, but shares the caller's memory and email.
     call = request.form.get("CallSid", caller)
     job = {"done": threading.Event(), "reply": None, "started": time.monotonic()}
     with calls_lock:
         calls[call] = job
-    threading.Thread(target=answer_call, args=(call, said, job), daemon=True).start()
+    threading.Thread(target=answer_call, args=(caller, user, role, call, said, job), daemon=True).start()
     # Most answers are ready in a few seconds; if not, let the caller know and keep waiting.
     if job["done"].wait(6):
         return speak_reply(resp, call)
@@ -285,16 +536,18 @@ calls = {}
 calls_lock = threading.Lock()
 
 
-def answer_call(call, said, job):
-    key = "call:" + call
-    history = load_history(key) + [{"role": "user", "content": said}]
+def answer_call(caller, user, role, call, said, job):
+    key = f"call:{caller}:{call}"
+    history = store.load_history(key, HISTORY_TURNS) + [{"role": "user", "content": said}]
     try:
-        job["reply"] = ask_claude(history, key, model=VOICE_MODEL, system=VOICE_SYSTEM_PROMPT,
-                                  max_tokens=800)
-        save(key, "user", said)
-        save(key, "assistant", job["reply"])
+        job["reply"] = ask_claude(caller, user, role, history, model=VOICE_MODEL,
+                                  system=VOICE_SYSTEM_PROMPT, max_tokens=800)
+        store.save_message(key, "user", said)
+        store.save_message(key, "assistant", job["reply"])
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
+    except Exception as e:
+        app.logger.exception("Call answer failed: %s", e)
     finally:
         job["done"].set()
 
