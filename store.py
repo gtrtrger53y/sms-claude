@@ -17,12 +17,19 @@ DB_PATH = os.environ.get("DB_PATH", "conversations.db")
 USE_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
 if USE_POSTGRES:
-    from psycopg_pool import ConnectionPool
+    import psycopg
+    from psycopg_pool import ConnectionPool, PoolTimeout
 
     # A small pool keeps connections open between texts, so replies stay fast.
     # check= reopens connections that Neon closed while it was asleep.
-    _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False,
-                           check=ConnectionPool.check_connection, kwargs={"autocommit": True})
+    # timeout: give up waiting for a connection after 5 seconds (Twilio hangs up at 15).
+    # max_idle: drop connections idle for a minute, before Neon or the network kills them.
+    # connect_timeout and keepalives: notice a dead connection in seconds instead of hanging.
+    _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False, timeout=5,
+                           max_idle=60, check=ConnectionPool.check_connection,
+                           kwargs={"autocommit": True, "connect_timeout": 5, "keepalives": 1,
+                                   "keepalives_idle": 30, "keepalives_interval": 10,
+                                   "keepalives_count": 3})
     _pool_lock = threading.Lock()
     _pool_open = False
 else:
@@ -65,13 +72,20 @@ def _run(query, params=(), fetch=None):
     """Run one statement. fetch is None, 'one' or 'all'."""
     if USE_POSTGRES:
         _ensure_pool()
-        with _pool.connection() as conn:
-            cur = conn.execute(_sql(query), params)
-            if fetch == "one":
-                return cur.fetchone()
-            if fetch == "all":
-                return cur.fetchall()
-            return cur.rowcount
+        for attempt in range(2):
+            try:
+                with _pool.connection() as conn:
+                    cur = conn.execute(_sql(query), params)
+                    if fetch == "one":
+                        return cur.fetchone()
+                    if fetch == "all":
+                        return cur.fetchall()
+                    return cur.rowcount
+            except (psycopg.OperationalError, PoolTimeout):
+                # A dead connection: throw the bad ones away and try once more.
+                if attempt:
+                    raise
+                _pool.check()
     with _sqlite_lock:
         conn = sqlite3.connect(DB_PATH)
         try:
@@ -88,7 +102,7 @@ def _ensure_pool():
     if not _pool_open:
         with _pool_lock:
             if not _pool_open:
-                _pool.open(wait=True, timeout=30)
+                _pool.open(wait=True, timeout=10)
                 _pool_open = True
 
 
