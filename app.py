@@ -56,6 +56,10 @@ MAX_MEMORY_CHARS = 2000
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-sonnet-5-5")
 # Any Twilio text-to-speech voice name, e.g. "Polly.Matthew-Neural".
 VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
+# Speech recognition model for calls. Other options: deepgram_nova-3, phone_call, googlev2_chirp_3.
+SPEECH_MODEL = os.environ.get("SPEECH_MODEL", "googlev2_telephony").strip()
+# Seconds of silence before your turn ends, or "auto" for the first pause.
+SPEECH_TIMEOUT = os.environ.get("SPEECH_TIMEOUT", "auto").strip() or "auto"
 # Lets Claude know today's date and time where you live.
 TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 # Set WEB_SEARCH=off to stop Claude looking things up online (each search costs about a cent).
@@ -469,8 +473,11 @@ def voice_twiml(resp):
 
 def listen(resp, prompt=None):
     """Ask Twilio to record the caller's next sentence and send it to /voice/reply."""
-    gather = resp.gather(input="speech", action="/voice/reply", method="POST",
-                         speech_timeout="auto", language="en-US")
+    options = dict(input="speech", action="/voice/reply", method="POST",
+                   speech_timeout=SPEECH_TIMEOUT, language="en-US")
+    if SPEECH_MODEL:
+        options["speech_model"] = SPEECH_MODEL
+    gather = resp.gather(**options)
     if prompt:
         gather.say(prompt, voice=VOICE_NAME)
     # Reached only if the caller says nothing.
