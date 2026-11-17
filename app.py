@@ -7,10 +7,14 @@ connected Gmail. It's private: only numbers the owner has added (friends) reach
 Claude. Anyone else gets one short reply saying it's private.
 
 The owner manages members by texting the service number:
-  ADD +15551234567 [name]   let a number in
+  ADD +15551234567 [name]   let a number in (also un-bans)
   REMOVE +15551234567       take a number out
+  BAN +15551234567          block a number completely: no replies, calls rejected
   LIST                      see who's in
   WAITING                   see numbers that texted but aren't in yet
+
+On a call, the owner can press 8 five times (88888) while Claude is listening to
+open a keypad admin menu: add, ban, or hear the member and waiting lists.
 
 Twilio forwards each incoming text to POST /sms and each call to POST /voice.
 Answers that take a while (web search, email) are worked out in the background:
@@ -44,10 +48,13 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 # added by texting ADD. The owner's number (below) is always allowed.
 ALLOWED_NUMBERS = {p for p in (store.normalize_phone(n) for n in
                                os.environ.get("ALLOWED_NUMBERS", "").split(",")) if p}
-# The number that can text ADD / REMOVE / LIST. Defaults to the first ALLOWED_NUMBERS entry.
-OWNER_NUMBER = store.normalize_phone(os.environ.get("OWNER_NUMBER", "")) or next(
-    (p for p in (store.normalize_phone(n) for n in os.environ.get("ALLOWED_NUMBERS", "").split(","))
-     if p), None)
+# The number(s) that can text ADD / REMOVE / LIST and open the call admin menu, comma-separated
+# if you have more than one phone. Defaults to the first ALLOWED_NUMBERS entry.
+OWNER_NUMBERS = [p for p in (store.normalize_phone(n) for n in
+                             os.environ.get("OWNER_NUMBER", "").split(",")) if p] or [
+    p for p in (store.normalize_phone(n) for n in os.environ.get("ALLOWED_NUMBERS", "").split(",")) if p][:1]
+# The first owner number gets the "new number texted" notices.
+OWNER_NUMBER = OWNER_NUMBERS[0] if OWNER_NUMBERS else None
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
 # Most texts a member (not the owner) can send in 24 hours. 0 means no limit.
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))
@@ -56,6 +63,10 @@ MAX_MEMORY_CHARS = 2000
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "claude-sonnet-5-5")
 # Any Twilio text-to-speech voice name, e.g. "Polly.Matthew-Neural".
 VOICE_NAME = os.environ.get("VOICE_NAME", "Polly.Joanna-Neural")
+# How fast the voice talks: "100%" is normal, "120%" a bit quicker. Works with Polly voices.
+VOICE_RATE = os.environ.get("VOICE_RATE", "120%").strip()
+# Keys the owner presses during a call to open the admin menu.
+ADMIN_CODE = os.environ.get("ADMIN_CODE", "88888").strip()
 # Speech recognition model for calls. Other options: deepgram_nova-3, phone_call, googlev2_chirp_3.
 SPEECH_MODEL = os.environ.get("SPEECH_MODEL", "googlev2_telephony").strip()
 # Seconds of silence before your turn ends, or "auto" for the first pause.
@@ -123,7 +134,8 @@ HELP_TEXT = (
     "I remember, FORGET ALL clears it. CONNECT EMAIL links your Gmail. DELETE MY DATA erases "
     "everything. Reply STOP to opt out. Msg & data rates may apply."
 )
-OWNER_HELP = "Owner: ADD +15551234567 [name], REMOVE +15551234567, LIST, WAITING."
+OWNER_HELP = ("Owner: ADD +15551234567 [name], REMOVE +15551234567, BAN +15551234567, LIST, WAITING. "
+              f"On a call, press {ADMIN_CODE} for the keypad admin menu.")
 
 app = Flask(__name__)
 app.register_blueprint(pages)
@@ -178,7 +190,7 @@ def account(phone):
     """Return (role, user) where role is 'owner', 'member', or None for everyone else."""
     if not phone:
         return None, None
-    if phone == OWNER_NUMBER:
+    if phone in OWNER_NUMBERS:
         return "owner", store.ensure_user(phone, "active")
     user = store.get_user(phone)
     if phone in ALLOWED_NUMBERS:
@@ -232,7 +244,7 @@ def owner_command(body, our_number):
     command = words[0].upper() if words else ""
     if command == "LIST" and len(words) == 1:
         members = store.list_users("active")
-        others = [(p, n) for p, n in members if p != OWNER_NUMBER]
+        others = [(p, n) for p, n in members if p not in OWNER_NUMBERS]
         if not others:
             return "No members yet besides you. Text ADD +15551234567 to add one."
         lines = [f"{p}{' ' + n if n else ''}" for p, n in others]
@@ -242,7 +254,7 @@ def owner_command(body, our_number):
         if not waiting:
             return "Nobody is waiting."
         return "Texted but not added yet:\n" + "\n".join(p for p, _ in waiting) + "\nReply ADD +1... to add one."
-    if command not in {"ADD", "REMOVE"} or len(words) < 2:
+    if command not in {"ADD", "REMOVE", "BAN"} or len(words) < 2:
         return None
     # The number may be typed with spaces, like "ADD +1 555 123 4567 Sam".
     end = 1
@@ -251,24 +263,37 @@ def owner_command(body, our_number):
     phone, rest = store.normalize_phone(" ".join(words[1:end])), words[end:]
     if not phone:
         return f"I couldn't read that number. Try: {command} +15551234567"
-    if phone == OWNER_NUMBER:
+    if phone in OWNER_NUMBERS:
         return "That's your own number; it's always allowed."
     name = " ".join(rest)[:40]
     if command == "ADD":
-        before = store.get_user(phone)
-        store.set_status(phone, "active", name or (before or {}).get("name", ""))
-        welcomed = False
-        # Only text people who already texted in (they asked to join).
-        if before and before.get("last_seen"):
-            welcomed = send_text(phone, our_number,
-                                 f"You're in! Text anything to chat with {SERVICE_NAME}. Text HELP for "
-                                 "commands. Reply STOP to opt out.")
+        welcomed = add_member(phone, name, our_number)
         return f"Added {phone}{' (' + name + ')' if name else ''}." + (" I texted them." if welcomed else "")
+    if command == "BAN":
+        ban_number(phone)
+        return f"Banned {phone}. They get no replies and their calls are rejected. ADD them to undo."
     user = store.get_user(phone)
     if not user or user["status"] != "active":
         return f"{phone} isn't a member."
     store.set_status(phone, "removed")
     return f"Removed {phone}. Their saved chats stay until they text DELETE MY DATA."
+
+
+def add_member(phone, name, our_number):
+    """Let a number in (or back in after a ban). Returns True if they were texted a welcome."""
+    before = store.get_user(phone)
+    store.set_status(phone, "active", name or (before or {}).get("name", ""))
+    # Only text people who already texted in (they asked to join).
+    if before and before.get("last_seen") and before.get("status") != "banned":
+        return send_text(phone, our_number,
+                         f"You're in! Text anything to chat with {SERVICE_NAME}. Text HELP for "
+                         "commands. Reply STOP to opt out.")
+    return False
+
+
+def ban_number(phone):
+    """Block a number completely: its texts get no reply and its calls are rejected."""
+    store.set_status(phone, "banned")
 
 
 def connect_link(phone):
@@ -397,6 +422,8 @@ def sms():
     if upper in OPT_OUT_WORDS:
         return twiml("")
     role, user = account(phone)
+    if role is None and user and user["status"] == "banned":
+        return twiml("")
     if role is None:
         return twiml(stranger_reply(phone, body, our_number, user))
     store.touch(phone)
@@ -471,17 +498,27 @@ def voice_twiml(resp):
     return str(resp), 200, {"Content-Type": "application/xml"}
 
 
+def say(target, text):
+    """Speak text on a call (or inside a gather), at the VOICE_RATE speed."""
+    if VOICE_RATE and VOICE_RATE != "100%":
+        target.say(voice=VOICE_NAME).prosody(text, rate=VOICE_RATE)
+    else:
+        target.say(text, voice=VOICE_NAME)
+
+
 def listen(resp, prompt=None):
-    """Ask Twilio to record the caller's next sentence and send it to /voice/reply."""
-    options = dict(input="speech", action="/voice/reply", method="POST",
-                   speech_timeout=SPEECH_TIMEOUT, language="en-US")
+    """Ask Twilio to record the caller's next sentence (or keypad presses) and send it to /voice/reply."""
+    options = dict(input="speech dtmf", action="/voice/reply", method="POST",
+                   speech_timeout=SPEECH_TIMEOUT, language="en-US",
+                   # Keypad: stop as soon as the admin code's worth of keys is pressed.
+                   num_digits=len(ADMIN_CODE) or 5, finish_on_key="#")
     if SPEECH_MODEL:
         options["speech_model"] = SPEECH_MODEL
     gather = resp.gather(**options)
     if prompt:
-        gather.say(prompt, voice=VOICE_NAME)
+        say(gather, prompt)
     # Reached only if the caller says nothing.
-    resp.say("I didn't hear anything, so I'll hang up. Call back any time.", voice=VOICE_NAME)
+    say(resp, "I didn't hear anything, so I'll hang up. Call back any time.")
     resp.hangup()
 
 
@@ -495,10 +532,12 @@ def voice():
     if not is_from_twilio():
         abort(403)
     resp = VoiceResponse()
-    role, _ = account(caller_number())
+    role, user = account(caller_number())
+    if role is None and user and user["status"] == "banned":
+        resp.reject()  # sounds busy, and the call isn't answered
+        return voice_twiml(resp)
     if role is None:
-        resp.say(f"Sorry, {SERVICE_NAME} is a private service. If you know the owner, ask them to add your number.",
-                 voice=VOICE_NAME)
+        say(resp, f"Sorry, {SERVICE_NAME} is a private service. If you know the owner, ask them to add your number.")
         resp.hangup()
         return voice_twiml(resp)
     listen(resp, "Hi, this is Claude. What's on your mind?")
@@ -516,12 +555,16 @@ def voice_reply():
         resp.hangup()
         return voice_twiml(resp)
 
+    digits = request.form.get("Digits", "").strip()
+    if digits and ADMIN_CODE and digits == ADMIN_CODE and role == "owner":
+        resp.redirect("/voice/admin", method="POST")
+        return voice_twiml(resp)
     said = request.form.get("SpeechResult", "").strip()
     if not said:
         listen(resp, "Sorry, I didn't catch that. Could you say it again?")
         return voice_twiml(resp)
     if said.lower().strip(" .!?") in GOODBYES:
-        resp.say("Talk to you later. Goodbye!", voice=VOICE_NAME)
+        say(resp, "Talk to you later. Goodbye!")
         resp.hangup()
         return voice_twiml(resp)
 
@@ -534,7 +577,7 @@ def voice_reply():
     # Most answers are ready in a few seconds; if not, let the caller know and keep waiting.
     if job["done"].wait(6):
         return speak_reply(resp, call)
-    resp.say("One moment.", voice=VOICE_NAME)
+    say(resp, "One moment.")
     resp.redirect("/voice/wait", method="POST")
     return voice_twiml(resp)
 
@@ -563,7 +606,7 @@ def speak_reply(resp, call):
     with calls_lock:
         job = calls.pop(call, None)
     if job and job["reply"]:
-        resp.say(job["reply"], voice=VOICE_NAME)
+        say(resp, job["reply"])
         listen(resp)
     else:
         listen(resp, "Sorry, I couldn't reach Claude just now. Try asking again.")
@@ -585,6 +628,130 @@ def voice_wait():
         return speak_reply(resp, call)
     resp.redirect("/voice/wait", method="POST")
     return voice_twiml(resp)
+
+
+# ---------- keypad admin menu (owner only, on a call) ----------
+
+ADMIN_MENU = ("Admin mode. Press 1 to add a number. Press 2 to ban a number. "
+              "Press 3 to hear your members. Press 4 to hear numbers waiting to join. "
+              "Press star to go back to Claude.")
+
+
+def admin_caller():
+    """The caller's number if they're the owner, else None. Every admin step checks this again."""
+    if not is_from_twilio():
+        abort(403)
+    caller = caller_number()
+    role, _ = account(caller)
+    return caller if role == "owner" else None
+
+
+def spoken_number(phone):
+    """'+15551234567' -> '5 5 5, 1 2 3, 4 5 6 7', so the voice reads it digit by digit."""
+    digits = phone[2:] if phone.startswith("+1") and len(phone) == 12 else phone.lstrip("+")
+    groups = [digits[:3], digits[3:6], digits[6:]] if len(digits) == 10 else [digits]
+    return ", ".join(" ".join(g) for g in groups if g)
+
+
+def admin_menu(resp, before=None):
+    gather = resp.gather(input="dtmf", num_digits=1, timeout=8,
+                         action="/voice/admin/choice", method="POST")
+    if before:
+        say(gather, before)
+    say(gather, ADMIN_MENU)
+    # No key pressed: leave admin mode and go back to chatting.
+    say(resp, "Leaving admin mode.")
+    listen(resp, "What's on your mind?")
+    return voice_twiml(resp)
+
+
+def ask_for_number(resp, action, before=None):
+    gather = resp.gather(input="dtmf", finish_on_key="#", timeout=10, num_digits=15,
+                         action=f"/voice/admin/number?action={action}", method="POST")
+    verb = "add" if action == "add" else "ban"
+    say(gather, (before + " " if before else "") +
+        f"Enter the phone number to {verb}, then press pound.")
+    return admin_menu(resp, "I didn't get a number.")
+
+
+@app.post("/voice/admin")
+def voice_admin():
+    resp = VoiceResponse()
+    if not admin_caller():
+        listen(resp)
+        return voice_twiml(resp)
+    return admin_menu(resp)
+
+
+@app.post("/voice/admin/choice")
+def voice_admin_choice():
+    resp = VoiceResponse()
+    if not admin_caller():
+        listen(resp)
+        return voice_twiml(resp)
+    choice = request.form.get("Digits", "")
+    if choice == "1":
+        return ask_for_number(resp, "add")
+    if choice == "2":
+        return ask_for_number(resp, "ban")
+    if choice == "3":
+        members = [(p, n) for p, n in store.list_users("active") if p not in OWNER_NUMBERS]
+        if not members:
+            return admin_menu(resp, "You have no members yet besides you.")
+        names = [n or spoken_number(p) for p, n in members[:10]]
+        more = f" and {len(members) - 10} more" if len(members) > 10 else ""
+        return admin_menu(resp, f"You have {len(members)} member{'s' if len(members) != 1 else ''}: "
+                                + ". ".join(names) + more + ".")
+    if choice == "4":
+        waiting = store.list_users("pending")[-5:]
+        if not waiting:
+            return admin_menu(resp, "Nobody is waiting.")
+        return admin_menu(resp, "Waiting to join: " + ". ".join(spoken_number(p) for p, _ in waiting) + ".")
+    if choice == "*":
+        listen(resp, "Okay, back to chatting. What's on your mind?")
+        return voice_twiml(resp)
+    return admin_menu(resp, "That's not an option.")
+
+
+@app.post("/voice/admin/number")
+def voice_admin_number():
+    resp = VoiceResponse()
+    if not admin_caller():
+        listen(resp)
+        return voice_twiml(resp)
+    action = "ban" if request.args.get("action") == "ban" else "add"
+    phone = store.normalize_phone(request.form.get("Digits", ""))
+    if not phone:
+        return ask_for_number(resp, action, "I couldn't read that number.")
+    if phone in OWNER_NUMBERS:
+        return admin_menu(resp, "That's your own number, so I left it alone.")
+    gather = resp.gather(input="dtmf", num_digits=1, timeout=8, method="POST",
+                         action=f"/voice/admin/confirm?action={action}&phone={phone[1:]}")
+    say(gather, f"You entered {spoken_number(phone)}. Press 1 to {action} it. "
+                "Press 2 to enter it again. Press star to cancel.")
+    return admin_menu(resp, "Nothing changed.")
+
+
+@app.post("/voice/admin/confirm")
+def voice_admin_confirm():
+    resp = VoiceResponse()
+    if not admin_caller():
+        listen(resp)
+        return voice_twiml(resp)
+    action = "ban" if request.args.get("action") == "ban" else "add"
+    phone = store.normalize_phone("+" + request.args.get("phone", ""))
+    choice = request.form.get("Digits", "")
+    if choice == "2":
+        return ask_for_number(resp, action)
+    if choice != "1" or not phone or phone in OWNER_NUMBERS:
+        return admin_menu(resp, "Cancelled. Nothing changed.")
+    if action == "add":
+        welcomed = add_member(phone, "", request.form.get("To", ""))
+        done = f"Added {spoken_number(phone)}." + (" I texted them." if welcomed else "")
+    else:
+        ban_number(phone)
+        done = f"Banned {spoken_number(phone)}. They won't get replies, and their calls are rejected."
+    return admin_menu(resp, done)
 
 
 if __name__ == "__main__":
