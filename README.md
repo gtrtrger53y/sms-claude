@@ -18,8 +18,11 @@ Only numbers you add reach Claude. Anyone else who texts gets one short reply sa
 |---|---|
 | `ADD +15551234567` | Lets that number in. Add a name after it if you like: `ADD +15551234567 Sam`. If they texted before, they get a "You're in!" text. |
 | `REMOVE +15551234567` | Takes that number out. |
+| `BAN +15551234567` | Blocks that number completely: its texts get no reply and its calls are rejected. `ADD` it again to undo. |
 | `LIST` | Shows everyone who's in. |
 | `WAITING` | Shows numbers that texted but haven't been added. |
+
+**On a phone call (owner only):** press 8 five times (`88888`) while Claude is listening (after it finishes talking). That opens the admin menu: 1 to add a number, 2 to ban one, 3 to hear your members, 4 to hear numbers waiting to join, star to go back to Claude. Type the number on the keypad and press pound; Claude reads it back and you press 1 to confirm. For anyone else, `88888` does nothing.
 
 **For you and your friends:**
 
@@ -42,7 +45,7 @@ People can also just say "remember that my mom's birthday is May 3" and Claude s
 2. In Render, open your service, go to **Environment**, and make sure these are set:
    - `DATABASE_URL`: your Neon connection string (you already added this).
    - `SECRET_KEY`: click **Add Environment Variable**, type `SECRET_KEY` as the name, and click **Generate** for the value. This encrypts friends' email passwords. Don't change it later, or everyone has to reconnect their email.
-   - `OWNER_NUMBER`: your own cell number, like `+15551234567`. If you leave it out, the first number in `ALLOWED_NUMBERS` counts as yours.
+   - `OWNER_NUMBER`: your own cell number, like `+15551234567`. If you have two phones, separate them with a comma: `+15551234567,+15559876543`. If you leave it out, the first number in `ALLOWED_NUMBERS` counts as yours.
    - `TWILIO_ACCOUNT_SID`: if it isn't there yet. It's needed to text you about new numbers, to send "You're in!" texts, and to send slow answers.
    - Keep `ANTHROPIC_API_KEY`, `TWILIO_AUTH_TOKEN`, and the rest as they are. `ALLOWED_NUMBERS` still works; those numbers are always let in.
 3. In Render, under **Settings → Start Command**, use:
@@ -62,6 +65,8 @@ Old conversations from the first version aren't copied over (they were lost on e
 | `SERVICE_NAME` | `Claude SMS Assistant` | The name used in texts and on the website. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | `claude-haiku-5-5` is much cheaper and faster; `claude-opus-5-5` is smartest. |
 | `VOICE_MODEL`, `VOICE_NAME` | Sonnet 5.5, `Polly.Joanna-Neural` | For phone calls. |
+| `VOICE_RATE` | `120%` | How fast the call voice talks. `100%` is normal speed; try `110%` to `130%`. |
+| `ADMIN_CODE` | `88888` | Keys that open the admin menu on a call. |
 | `WEB_SEARCH` | `on` | `off` stops web searches (each costs about a cent). |
 | `TIMEZONE` | `America/New_York` | So Claude knows the local date and time. |
 | `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD` | none | Your own Gmail. Only your number uses these; friends connect their own with `CONNECT EMAIL`. |
