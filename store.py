@@ -52,6 +52,12 @@ SCHEMA = [
         purpose TEXT NOT NULL,
         expires_at DOUBLE PRECISION NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS media (
+        id TEXT PRIMARY KEY,
+        data {blob} NOT NULL,
+        content_type TEXT NOT NULL,
+        expires_at DOUBLE PRECISION NOT NULL
+    )""",
 ]
 
 
@@ -88,8 +94,9 @@ def _run(query, params=(), fetch=None):
 
 def init():
     serial = "BIGSERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    blob = "BYTEA" if USE_POSTGRES else "BLOB"
     for statement in SCHEMA:
-        _run(statement.replace("{serial}", serial))
+        _run(statement.replace("{serial}", serial).replace("{blob}", blob))
 
 
 # ---------- phone numbers ----------
@@ -219,3 +226,21 @@ def use_link_token(token, purpose):
     if phone:
         _run("DELETE FROM link_tokens WHERE token = ?", (token,))
     return phone
+
+
+# ---------- pictures Claude drew (kept briefly so Twilio can fetch them) ----------
+
+def save_media(data, content_type="image/png", hours=24):
+    _run("DELETE FROM media WHERE expires_at < ?", (time.time(),))
+    media_id = secrets.token_urlsafe(16)
+    _run("INSERT INTO media (id, data, content_type, expires_at) VALUES (?, ?, ?, ?)",
+         (media_id, data, content_type, time.time() + hours * 3600))
+    return media_id
+
+
+def get_media(media_id):
+    """Return (bytes, content_type) if the picture exists and hasn't expired, else None."""
+    row = _run("SELECT data, content_type, expires_at FROM media WHERE id = ?", (media_id,), "one")
+    if not row or row[2] < time.time():
+        return None
+    return bytes(row[0]), row[1]

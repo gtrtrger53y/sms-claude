@@ -19,6 +19,9 @@ open a keypad admin menu: add, ban, or hear the member and waiting lists.
 Twilio forwards each incoming text to POST /sms and each call to POST /voice.
 Answers that take a while (web search, email) are worked out in the background:
 calls wait on /voice/wait, and texts are sent through Twilio's API once ready.
+
+Pictures work both ways (see media.py): photos texted in are shown to Claude, and
+Claude can text back simple pictures it draws as SVG, served from /media/<id>.png.
 """
 
 import os
@@ -29,13 +32,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import anthropic
-from flask import Flask, abort, request
+from flask import Flask, Response, abort, request
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.twiml.voice_response import VoiceResponse
 
 import gmail
+import media
 import store
 from pages import PAY_LINK, PRICE_TEXT, SERVICE_NAME, pages
 
@@ -130,7 +134,8 @@ OPT_OUT_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "OPT
                  "START", "UNSTOP"}
 
 HELP_TEXT = (
-    f"{SERVICE_NAME}: text anything to chat with Claude, an AI. RESET starts fresh. MEMORY shows what "
+    f"{SERVICE_NAME}: text anything to chat with Claude, an AI, or send a photo to ask about it. "
+    "Ask for a diagram or chart and Claude can text one back. RESET starts fresh. MEMORY shows what "
     "I remember, FORGET ALL clears it. CONNECT EMAIL links your Gmail. DELETE MY DATA erases "
     "everything. Reply STOP to opt out. Msg & data rates may apply."
 )
@@ -204,16 +209,30 @@ def account(phone):
     return None, user
 
 
-def send_text(to, from_, body):
+def send_text(to, from_, body, media_urls=None):
+    """Text someone through Twilio's API, with pictures attached if media_urls is given."""
     if not TWILIO_ACCOUNT_SID:
         return False
+    twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    if media_urls:
+        try:
+            twilio.messages.create(to=to, from_=from_, body=body[:MAX_SMS_CHARS], media_url=list(media_urls))
+            return True
+        except Exception as e:
+            # Send the words anyway, so a picture problem never swallows the answer.
+            app.logger.error("Couldn't send picture text, sending words only: %s", e)
+            body += " (I tried to send a picture too, but it didn't go through.)"
     try:
-        TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN).messages.create(
-            to=to, from_=from_, body=body[:MAX_SMS_CHARS])
+        twilio.messages.create(to=to, from_=from_, body=body[:MAX_SMS_CHARS])
         return True
     except Exception as e:
         app.logger.error("Couldn't send text: %s", e)
         return False
+
+
+def public_base():
+    """The app's public https address, for links and picture URLs. Call inside a request."""
+    return PUBLIC_URL or request.url_root.rstrip("/").replace("http://", "https://", 1)
 
 
 def stranger_reply(phone, body, our_number, user):
@@ -299,7 +318,7 @@ def ban_number(phone):
 def connect_link(phone):
     if not gmail.can_store_passwords():
         return "Email connecting isn't set up yet (the owner needs to add SECRET_KEY)."
-    base = PUBLIC_URL or request.url_root.rstrip("/").replace("http://", "https://", 1)
+    base = public_base()
     token = store.new_link_token(phone, "gmail")
     return (f"Open this link to connect your Gmail (works once, for 15 minutes): {base}/connect/{token} "
             "Never text your password here.")
@@ -336,7 +355,22 @@ def forget(phone, text):
     return f"Deleted {len(notes) - len(kept)} note(s)."
 
 
-def run_tool(phone, creds, name, args, request_number):
+def make_picture(args, pictures):
+    """Claude's send_picture tool: draw the SVG, keep the PNG, and remember its id for the reply."""
+    if len(pictures) >= media.MAX_PICTURES_PER_REPLY:
+        return f"You've already attached {len(pictures)} pictures, which is the most per text."
+    try:
+        png = media.render_svg(args.get("svg", ""))
+    except ValueError as e:
+        return f"Couldn't make the picture: {e}"
+    caption = " ".join(str(args.get("caption", "")).split())[:100] or "a picture"
+    pictures.append({"id": store.save_media(png, "image/png"), "caption": caption})
+    return "Picture ready. It will be attached to your text reply, so just write a short message to go with it."
+
+
+def run_tool(phone, creds, name, args, request_number, pictures=None):
+    if name == "send_picture" and pictures is not None:
+        return make_picture(args, pictures)
     if name == "remember":
         return remember(phone, args.get("note", ""))
     if name == "forget":
@@ -347,7 +381,9 @@ def run_tool(phone, creds, name, args, request_number):
 
 
 def ask_claude(phone, user, role, history, model=ANTHROPIC_MODEL, system=SYSTEM_PROMPT,
-               max_tokens=1200, searches=3):
+               max_tokens=1200, searches=3, pictures=None):
+    """Ask Claude for a reply. Pass a list as pictures to let Claude draw pictures for a text;
+    the ones it makes are added to that list as {"id", "caption"}."""
     request_number = gmail.new_request()
     now = datetime.now(ZoneInfo(TIMEZONE))
     system = f"{system} Right now it is {now:%A, %B %-d, %Y, %-I:%M %p} ({TIMEZONE})."
@@ -358,6 +394,9 @@ def ask_claude(phone, user, role, history, model=ANTHROPIC_MODEL, system=SYSTEM_
     system += (" Your saved notes about this person:\n" + memory) if memory else " You have no saved notes yet."
     tools = [search_tool(model, searches)] if WEB_SEARCH and searches else []
     tools += MEMORY_TOOLS
+    if pictures is not None:
+        tools.append(media.SEND_PICTURE_TOOL)
+        system += media.PHOTO_PROMPT + media.PICTURE_PROMPT
     creds = gmail.credentials_for(user, role == "owner")
     if creds:
         tools += gmail.TOOLS
@@ -380,13 +419,13 @@ def ask_claude(phone, user, role, history, model=ANTHROPIC_MODEL, system=SYSTEM_
             text = []
             messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": block.id,
-                 "content": run_tool(phone, creds, block.name, block.input, request_number)}
+                 "content": run_tool(phone, creds, block.name, block.input, request_number, pictures)}
                 for block in response.content if block.type == "tool_use"
             ]})
         # A long web search can pause partway; send it back so Claude can finish.
         elif response.stop_reason != "pause_turn":
             break
-    return "".join(text).strip() or "(Claude had no reply.)"
+    return "".join(text).strip() or ("" if pictures else "(Claude had no reply.)")
 
 
 # ---------- texts ----------
@@ -402,10 +441,12 @@ def is_from_twilio():
     return validator.validate(url, request.form, request.headers.get("X-Twilio-Signature", ""))
 
 
-def twiml(text):
+def twiml(text, media_urls=()):
     resp = MessagingResponse()
-    if text:
-        resp.message(text[:MAX_SMS_CHARS])
+    if text or media_urls:
+        message = resp.message(text[:MAX_SMS_CHARS])
+        for url in media_urls:
+            message.media(url)
     return str(resp), 200, {"Content-Type": "application/xml"}
 
 
@@ -418,6 +459,7 @@ def sms():
     our_number = request.form.get("To", "")
     body = request.form.get("Body", "").strip()
     upper = " ".join(body.upper().split())
+    has_media = media.has_media(request.form)
 
     if upper in OPT_OUT_WORDS:
         return twiml("")
@@ -428,9 +470,9 @@ def sms():
         return twiml(stranger_reply(phone, body, our_number, user))
     store.touch(phone)
 
-    if not body:
+    if not body and not has_media:
         return twiml(HELP_TEXT)
-    if role == "owner":
+    if role == "owner" and body:
         reply = owner_command(body, our_number)
         if reply:
             return twiml(reply)
@@ -462,34 +504,76 @@ def sms():
             store.messages_since(phone, time.time() - 86400) >= DAILY_LIMIT:
         return twiml(f"You've reached today's limit of {DAILY_LIMIT} messages. Try again tomorrow!")
 
+    # Copy what's needed from the request: the reply may be worked out after it ends.
+    form = {k: v for k, v in request.form.items() if k == "NumMedia" or k.startswith("Media")}
+    base = public_base()
     if not TWILIO_ACCOUNT_SID:
-        return twiml(answer_text(phone, user, role, body))
+        reply, picture_urls = answer_text(phone, user, role, body, form, base)
+        return twiml(reply, picture_urls)
     # Reply in the background and text the answer when it's ready.
-    threading.Thread(target=send_text_reply, args=(phone, user, role, our_number, body),
+    threading.Thread(target=send_text_reply, args=(phone, user, role, our_number, body, form, base),
                      daemon=True).start()
     return twiml("")
 
 
-def answer_text(phone, user, role, body):
-    history = store.load_history(phone, HISTORY_TURNS) + [{"role": "user", "content": body}]
+def user_turn(body, form):
+    """What the person sent, as Claude message content, plus how to save it in the history.
+    Returns (content, saved_text), or (None, reply) if there's nothing Claude can use."""
+    if not media.has_media(form):
+        return body, body
+    photos, skipped = media.incoming_media(form, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+                                           log=app.logger.warning)
+    if not photos and not body:
+        what = ", ".join(skipped) or "that"
+        return None, (f"Sorry, I can't open {what}. I can read photos and text, so send a picture "
+                      "or tell me in words what you need.")
+    text = body or "(They sent this with no message.)"
+    if skipped:
+        text += f"\n[They also sent {', '.join(skipped)}, which you can't open. Mention that briefly.]"
+    saved = body
+    if photos:
+        saved = (body + "\n" if body else "") + f"[sent {len(photos)} photo{'s' if len(photos) > 1 else ''}]"
+    if skipped:
+        saved += f"\n[also sent {', '.join(skipped)}]"
+    return photos + [{"type": "text", "text": text}], saved.strip()
+
+
+def answer_text(phone, user, role, body, form=None, base=""):
+    """Returns (reply text, list of picture URLs to attach)."""
+    content, saved = user_turn(body, form or {})
+    if content is None:
+        return saved, []
+    history = store.load_history(phone, HISTORY_TURNS) + [{"role": "user", "content": content}]
+    pictures = []
     try:
-        reply = ask_claude(phone, user, role, history)
+        reply = ask_claude(phone, user, role, history, pictures=pictures)
     except anthropic.APIError as e:
         app.logger.error("Claude API error: %s (cause: %s)", e, type(e.__cause__).__name__)
-        return "Sorry, I couldn't reach Claude just now. Please try again in a minute."
-    store.save_message(phone, "user", body)
-    store.save_message(phone, "assistant", reply)
+        return "Sorry, I couldn't reach Claude just now. Please try again in a minute.", []
+    saved_reply = reply + "".join(f"\n[sent a picture: {p['caption']}]" for p in pictures)
+    store.save_message(phone, "user", saved)
+    store.save_message(phone, "assistant", saved_reply.strip())
     store.prune_history(phone, max(HISTORY_TURNS * 2, DAILY_LIMIT * 2) + 10)
-    return reply
+    return reply, [f"{base}/media/{p['id']}.png" for p in pictures]
 
 
-def send_text_reply(phone, user, role, our_number, body):
+def send_text_reply(phone, user, role, our_number, body, form=None, base=""):
     try:
-        reply = answer_text(phone, user, role, body)
+        reply, picture_urls = answer_text(phone, user, role, body, form, base)
     except Exception as e:
         app.logger.exception("Couldn't answer: %s", e)
-        reply = "Sorry, something went wrong. Please try again."
-    send_text(phone, our_number, reply)
+        reply, picture_urls = "Sorry, something went wrong. Please try again.", []
+    send_text(phone, our_number, reply, picture_urls)
+
+
+@app.get("/media/<media_id>.png")
+def media_file(media_id):
+    """Pictures Claude drew, for Twilio to fetch. Each link is random and expires after a day."""
+    found = store.get_media(media_id)
+    if not found:
+        abort(404)
+    data, content_type = found
+    return Response(data, mimetype=content_type, headers={"Cache-Control": "private, max-age=86400"})
 
 
 # ---------- phone calls ----------

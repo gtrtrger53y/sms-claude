@@ -39,6 +39,20 @@ Only numbers you add reach Claude. Anyone else who texts gets one short reply sa
 
 People can also just say "remember that my mom's birthday is May 3" and Claude saves it.
 
+## Pictures
+
+- **Send Claude a photo.** Text a picture (with or without words) and Claude looks at it: "what plant is this?", "solve this worksheet problem", "what does this sign say?". Up to 5 photos per text. iPhone HEIC photos work too. Videos, audio and other files get a polite "I can't open that".
+- **Claude can text pictures back.** Ask for a diagram, chart, graph, flowchart, simple map or labeled sketch, and Claude draws it and attaches it to the reply. It can't make realistic photos or edit your photos; it says so and offers a simple drawing instead.
+- Pictures only work in texts, not on phone calls.
+- Drawn pictures are kept for a day at a random link on your site (`/media/<id>.png`) so Twilio can fetch them, then deleted.
+
+## Upgrading from v3 (adding pictures)
+
+1. Replace `app.py`, `store.py`, `requirements.txt` and `README.md` in your GitHub repo with the ones in this folder, and add the new `media.py`. `gmail.py`, `pages.py` and `Procfile` are unchanged.
+2. Make sure `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` are set in Render (they already are). Twilio protects photo links with your account login, so the app needs both to download photos people send.
+3. Render redeploys by itself after the GitHub update. The new picture table is created automatically.
+4. Nothing to change in Twilio: toll-free numbers can send and receive pictures in the US and Canada. Pictures can only be tested once Twilio approves your toll-free registration, same as texts.
+
 ## Upgrading from the first version
 
 1. Replace the files in your GitHub repo with the ones in this folder (`app.py`, `gmail.py`, `pages.py`, `Procfile`, `requirements.txt`, `README.md`) and add the new `store.py`.
@@ -98,8 +112,8 @@ Holding friends' email access is a real responsibility, so only connect people w
 |---|---|
 | Render | $0 on the Free instance (sleeps when idle; the first text after a nap can be slow). $7/month for an always-on instance. The $25 Pro plan isn't needed. |
 | Neon | $0 on the Free plan (1 GB, plenty for texts). It naps after 5 idle minutes, so the first text after a quiet spell is about a second slower. |
-| Twilio | $2.15/month for a toll-free number ($1.15 local), plus about 1.2¢ per text segment in or out (carrier fees included). A segment is about 153 characters, so a 300-character reply is 2 segments. |
-| Claude API | About 1–2¢ per reply on Sonnet 5.5, plus about 1¢ per web search. Haiku 5.5 costs a small fraction of that. |
+| Twilio | $2.15/month for a toll-free number ($1.15 local), plus about 1.2¢ per text segment in or out (carrier fees included). A segment is about 153 characters, so a 300-character reply is 2 segments. A text with a picture (MMS) costs more: about 3¢ to send and 2 to 3¢ to receive on a toll-free number, carrier fees included. |
+| Claude API | About 1–2¢ per reply on Sonnet 5.5, plus about 1¢ per web search. A photo adds about half a cent; a drawn picture adds about a cent. Haiku 5.5 costs a small fraction of that. |
 | Stripe | No monthly fee; 2.9% + 30¢ per payment. |
 
 Roughly 5¢ per back-and-forth, so a friend who sends 100 texts a month costs you about $5. Prices were checked in November 2026.
