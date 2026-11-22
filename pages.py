@@ -1,3 +1,4 @@
+
 """Web pages: what the service is, terms, privacy, and the one-time email connect page.
 
 Carriers reviewing a toll-free or 10DLC registration look for the first three.
@@ -17,7 +18,7 @@ SERVICE_NAME = os.environ.get("SERVICE_NAME", "Claude SMS Assistant")
 OWNER_NAME = os.environ.get("OWNER_NAME", "the owner of this service")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 SMS_NUMBER = os.environ.get("SMS_NUMBER", "")
-# Optional: a payment page (for example a Stripe Payment Link) and what it costs.
+# Optional: a payment page and membership price.
 PAY_LINK = os.environ.get("PAY_LINK", "").strip()
 PRICE_TEXT = os.environ.get("PRICE_TEXT", "").strip()
 
@@ -55,15 +56,16 @@ LAYOUT = """<!doctype html>
 
 HOME = """
 <h1>{{ service }}</h1>
-<p>{{ service }} is a private text-message assistant. When a member sends a text message to
+<p>{{ service }} is a text-message assistant. When a member sends a text message to
 {% if number %}<strong>{{ number }}</strong>{% else %}our number{% endif %}, it replies with an
 answer written by Claude, an AI assistant made by Anthropic. You can also call the number and talk.</p>
 
 <h2>Who can use it</h2>
-<p>This is a private service run by {{ owner }} for themselves and a few friends they add. It is not
-offered to the public. Only phone numbers the operator has added can use it.
-{% if pay %}Members share the cost{% if price %} ({{ price }}){% endif %} through a secure payment page.{% endif %}
-If any other number texts, it gets a single reply saying the service is private, and nothing else.</p>
+<p>The service is open to anyone who signs up for a membership{% if price %} ({{ price }}){% endif %}.
+To join, text the number above and follow the payment instructions{% if pay %}
+using the secure <a href="{{ pay }}">payment page</a>{% endif %}.
+After payment is verified, {{ owner }} will activate your phone number and you will receive
+a confirmation text. Access is not active until your number has been added.</p>
 
 <h2>How you opt in</h2>
 <p>You opt in by sending the first text message to the number yourself. The service never sends a
