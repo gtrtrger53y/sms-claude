@@ -41,7 +41,7 @@ from twilio.twiml.voice_response import VoiceResponse
 import gmail
 import media
 import store
-from pages import PAY_LINK, PRICE_TEXT, SERVICE_NAME, pages
+from pages import CONTACT_EMAIL, PAY_LINK, PRICE_TEXT, SERVICE_NAME, pages
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -133,11 +133,20 @@ GOODBYES = {"bye", "goodbye", "good bye", "bye bye", "hang up", "that's all", "t
 OPT_OUT_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "OPTOUT", "REVOKE",
                  "START", "UNSTOP"}
 
+SUPPORT_TEXT = f" Support: {CONTACT_EMAIL}." if CONTACT_EMAIL else ""
+# Required details for every sign-up and help text (toll-free messaging rules).
+SMS_TERMS = "Msg frequency varies. Msg & data rates may apply. Reply HELP for help, STOP to opt out."
+
 HELP_TEXT = (
     f"{SERVICE_NAME}: text anything to chat with Claude, an AI, or send a photo to ask about it. "
     "Ask for a diagram or chart and Claude can text one back. RESET starts fresh. MEMORY shows what "
     "I remember, FORGET ALL clears it. CONNECT EMAIL links your Gmail. DELETE MY DATA erases "
-    "everything. Reply STOP to opt out. Msg & data rates may apply."
+    f"everything.{SUPPORT_TEXT} Msg frequency varies. Msg & data rates may apply. Reply STOP to opt out."
+)
+# HELP from a number that isn't a member yet.
+GUEST_HELP_TEXT = (
+    f"{SERVICE_NAME}: an AI assistant by text for members.{SUPPORT_TEXT} "
+    "Msg frequency varies. Msg & data rates may apply. Reply STOP to opt out."
 )
 OWNER_HELP = ("Owner: ADD +15551234567 [name], REMOVE +15551234567, BAN +15551234567, LIST, WAITING. "
               f"On a call, press {ADMIN_CODE} for the keypad admin menu.")
@@ -248,13 +257,11 @@ def stranger_reply(phone, body, our_number, user):
     if time.time() - (user.get("last_notice") or 0) < 86400 or not allow("stranger-reply", 200):
         return ""
     store.set_last_notice(phone)
-    text = f"Hi! {SERVICE_NAME} is a private AI assistant by text, just for friends of its owner."
+    text = f"{SERVICE_NAME}: thanks for signing up for membership."
     if PAY_LINK:
-        text += f" If you're joining{' (' + PRICE_TEXT + ')' if PRICE_TEXT else ''}, pay here: {PAY_LINK} "
-        text += "You'll get a text once your number is added."
-    else:
-        text += " If you know the owner, ask them to add your number."
-    return text + " Reply STOP to opt out."
+        text += f" To join{' (' + PRICE_TEXT + ')' if PRICE_TEXT else ''}, pay here: {PAY_LINK} ."
+    text += " You'll get a text when your number is activated."
+    return f"{text} {SMS_TERMS}"
 
 
 def owner_command(body, our_number):
@@ -305,8 +312,8 @@ def add_member(phone, name, our_number):
     # Only text people who already texted in (they asked to join).
     if before and before.get("last_seen") and before.get("status") != "banned":
         return send_text(phone, our_number,
-                         f"You're in! Text anything to chat with {SERVICE_NAME}. Text HELP for "
-                         "commands. Reply STOP to opt out.")
+                         f"{SERVICE_NAME}: you're in! Your membership is active. Text anything to "
+                         f"chat. {SMS_TERMS}")
     return False
 
 
@@ -466,6 +473,8 @@ def sms():
     role, user = account(phone)
     if role is None and user and user["status"] == "banned":
         return twiml("")
+    if role is None and upper in {"HELP", "INFO", "?"}:
+        return twiml(GUEST_HELP_TEXT if allow("guest-help", 200) else "")
     if role is None:
         return twiml(stranger_reply(phone, body, our_number, user))
     store.touch(phone)
